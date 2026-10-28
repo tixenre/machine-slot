@@ -1,0 +1,20 @@
+[package]
+name = "machine-slot"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["Mancino"]
+description = "A machine-wide queue for heavy work: builds and tests run side by side, benchmarks and UI tests run alone on a quiet machine, and every run is timed."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mancino-dev/machine-slot"
+readme = "README.md"
+keywords = ["benchmark", "queue", "scheduler", "ci", "macos"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/macos/menubar/build", "/.github"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

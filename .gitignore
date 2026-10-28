@@ -1,0 +1,8 @@
+/target
+/macos/menubar/build
+# Local installs and data, never part of the repository.
+/bin
+/data
+/legacy
+*.app
+.DS_Store

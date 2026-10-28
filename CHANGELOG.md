@@ -1,0 +1,17 @@
+# Changelog
+
+## 0.2.0
+
+First public release.
+
+- `solo` and `shared` turns: one FIFO queue for work that must run alone, side by side for the rest.
+- While a solo waits, shared work starts only if its usual time fits before the running work ends.
+- `--needs cpu,disk,ram,gpu,screen`: a solo waits for a quiet machine in what it needs.
+- Every run is recorded: wait, wall time, exit, CPU, peak memory of the whole process tree, load, whether it ran clean, and the test's identity, which stays the same across labels and worktrees.
+- `status`, `times`, `repeats`, `estimate`, `log`, `state [--json]`, `paths`.
+- A read-only MCP server (`machine-slot mcp`).
+- Claude Code integration: a hook, a skill and an installer.
+- Progress in %: exact when the command writes it to `MACHINE_SLOT_PROGRESS` («37», «0.37», «120/300»), estimated from the usual time otherwise.
+- Live resources per running job — CPU %, memory and disk MB/s of its whole tree — in `status`, `state`, the MCP and the menu bar; each run records its peak CPU and disk MB.
+- `solo --ask`: asks before quitting busy apps for a run and reopens them afterwards (`reopen` finishes the job if machine-slot was killed).
+- A macOS menu bar app with a progress bar per job and an opt-in Open at Login switch.

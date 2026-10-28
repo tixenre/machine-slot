@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+        env:
+          # Runners are never quiet; the calm wait is tested by hand.
+          MACHINE_SLOT_SETTLE: "0"
+      - name: menu bar app builds
+        run: swiftc -O macos/menubar/main.swift -o /tmp/machine-slot-bar
