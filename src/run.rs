@@ -84,6 +84,10 @@ pub fn run(
     // Per process, the counters last seen: rates come from what changed.
     let mut seen: HashMap<i32, sys::ProcUsage> = HashMap::new();
     let (mut last_sample, mut peak_cpu) = (Instant::now(), 0f64);
+    // CPU of the tree so far: each live process with its ended children.
+    // A process that ends moves into its parent's children time, so the sum
+    // only drops when the ended one's parent is outside the tree.
+    let mut last_cpu: Option<u64> = None;
     let status = loop {
         if let Ok(Some(st)) = child.try_wait() {
             break st;
@@ -91,19 +95,21 @@ pub fn run(
         if tick.is_multiple_of(5) {
             let dt = last_sample.elapsed().as_secs_f64().max(0.05);
             last_sample = Instant::now();
-            let (mut mem, mut dcpu, mut dio) = (0u64, 0u64, 0u64);
+            let (mut mem, mut cpu_total, mut dio) = (0u64, 0u64, 0u64);
             for pid in sys::tree(pgid) {
                 let Some(u) = sys::usage(pid) else { continue };
                 mem += u.footprint;
+                cpu_total += u.cpu_ns + u.child_cpu_ns;
                 if let Some(p) = seen.get(&pid) {
-                    dcpu += u.cpu_ns.saturating_sub(p.cpu_ns);
                     dio +=
                         (u.disk_read + u.disk_written).saturating_sub(p.disk_read + p.disk_written);
                 }
                 seen.insert(pid, u);
             }
             peak = peak.max(mem);
-            if tick > 0 {
+            let dcpu = last_cpu.map(|l| cpu_total.saturating_sub(l));
+            last_cpu = Some(cpu_total);
+            if let Some(dcpu) = dcpu {
                 let cpu = dcpu as f64 / 1e9 / dt * 100.0;
                 peak_cpu = peak_cpu.max(cpu);
                 let line = format!(

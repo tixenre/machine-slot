@@ -3,6 +3,7 @@
 
 mod ask;
 mod calm;
+mod hook;
 mod json;
 mod mcp;
 mod paths;
@@ -34,6 +35,9 @@ machine-slot repeats               tests run more than once (same command and re
 machine-slot estimate LABEL [solo|shared]
 machine-slot state [--json]        for the menu bar and scripts
 machine-slot mcp                   read-only MCP server on stdio
+machine-slot hook                  the Claude Code Bash check (JSON on stdin)
+machine-slot cancel LABEL          stop a job (its whole command), record it, free its turn
+machine-slot wait LABEL            wait for a job to end; exits as it did
 machine-slot reopen                reopen apps a killed --ask run left closed
 machine-slot paths                 where the queue, the record and the config live
 
@@ -110,15 +114,58 @@ pub fn live_text(j: &Job) -> String {
     }
 }
 
+/// Seconds until a running job should end: from its own progress, else its
+/// usual time (0 once it's past it). None without either.
+fn remaining(j: &Job, now: u64) -> Option<u64> {
+    let el = now.saturating_sub(j.start);
+    if let Some(p) = j.progress.filter(|&p| p > 0.02 && el > 2) {
+        return Some((el as f64 / p - el as f64).max(0.0).round() as u64);
+    }
+    j.usual.map(|u| u.saturating_sub(el))
+}
+
+/// The seconds a waiting solo should wait for its turn: the running work,
+/// then every solo ahead of it, each with its few seconds of settling.
+pub fn starts_in(jobs: &[Job], j: &Job, now: u64) -> Option<u64> {
+    const SETTLE_S: u64 = 5;
+    if !matches!(j.kind, Kind::Draining | Kind::Queued) {
+        return None;
+    }
+    let mut wait = 0;
+    for r in jobs
+        .iter()
+        .filter(|r| matches!(r.kind, Kind::Solo | Kind::Shared))
+    {
+        wait = wait.max(remaining(r, now)?);
+    }
+    for ahead in jobs
+        .iter()
+        .filter(|a| matches!(a.kind, Kind::Draining | Kind::Queued) && a.ticket < j.ticket)
+    {
+        wait += SETTLE_S + ahead.usual?;
+    }
+    Some(wait + SETTLE_S)
+}
+
 pub fn status_text(jobs: &[Job]) -> String {
     let now = sched::now();
     let mut out = String::new();
+    let mut place = 0;
     for j in jobs {
+        let eta = starts_in(jobs, j, now)
+            .map(|s| format!(", starts in ~{}", clock(s)))
+            .unwrap_or_default();
+        if j.kind == Kind::Queued {
+            place += 1;
+        }
         let line = match j.kind {
             Kind::Solo => format!("solo: {} ({}{})", j.label, left(j, now), live_text(j)),
             Kind::Shared => format!("shared: {} ({}{})", j.label, left(j, now), live_text(j)),
-            Kind::Draining => format!("next solo: {} (waiting for running work to end)", j.label),
-            Kind::Queued => format!("queued solo: {}", j.label),
+            Kind::Draining => format!(
+                "next solo: {} (waiting for running work to end{eta})",
+                j.label
+            ),
+            Kind::Queued => format!("queued solo: {} (#{place}{eta})", j.label),
             Kind::Waiting => format!("waiting shared: {}", j.label),
         };
         out.push_str(&line);
@@ -594,6 +641,12 @@ fn state(json: bool) {
                     ),
                     ("progress_measured", json::Json::Bool(j.progress.is_some())),
                     (
+                        "starts_in",
+                        starts_in(&jobs, j, sched::now())
+                            .map(|s| json::Json::Num(s as f64))
+                            .unwrap_or(json::Json::Null),
+                    ),
+                    (
                         "live",
                         j.live
                             .map(|(c, m, d)| {
@@ -610,10 +663,10 @@ fn state(json: bool) {
             .collect();
         println!("{}", json::Json::Arr(arr).dump());
     } else {
-        for j in jobs {
-            let f = fraction(&j, sched::now());
+        for j in &jobs {
+            let f = fraction(j, sched::now());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 j.kind.name(),
                 j.label,
                 j.start,
@@ -624,10 +677,81 @@ fn state(json: bool) {
                     .unwrap_or_default(),
                 j.live
                     .map(|l| format!("{:.0}\t{}\t{:.1}", l.0, l.1, l.2))
-                    .unwrap_or_else(|| "\t\t".into())
+                    .unwrap_or_else(|| "\t\t".into()),
+                starts_in(&jobs, j, sched::now())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
             );
         }
     }
+}
+
+/// The live jobs a label names: the exact label, else the same task key.
+fn named(label: &str) -> Vec<Job> {
+    let jobs = sched::peek(&state_dir());
+    let exact: Vec<Job> = jobs.iter().filter(|j| j.label == label).cloned().collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let key = record::key_of(label);
+    jobs.into_iter()
+        .filter(|j| record::key_of(&j.label) == key)
+        .collect()
+}
+
+/// Stops a job the way Ctrl-C would: machine-slot stops its whole command,
+/// records the run and frees the turn.
+fn cancel(label: &str) -> i32 {
+    let jobs = named(label);
+    match jobs.len() {
+        0 => {
+            eprintln!("machine-slot: no job «{label}»");
+            1
+        }
+        1 => {
+            sys::send(jobs[0].pid, sys::SIGTERM);
+            println!("stopping «{}» ({})", jobs[0].label, jobs[0].kind.name());
+            0
+        }
+        _ => {
+            eprintln!(
+                "machine-slot: «{label}» names {} jobs; use the exact label:",
+                jobs.len()
+            );
+            for j in &jobs {
+                eprintln!("  {}", j.label);
+            }
+            1
+        }
+    }
+}
+
+/// Waits until no job by that label is left; exits as its last run did.
+fn wait_for(label: &str) -> i32 {
+    let since = sched::now();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let jobs = named(label);
+        if jobs.is_empty() {
+            break;
+        }
+        for j in jobs {
+            if !seen.contains(&j.label) {
+                seen.push(j.label);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if seen.is_empty() {
+        eprintln!("machine-slot: no job «{label}»");
+        return 1;
+    }
+    record::read(&record_path())
+        .iter()
+        .rev()
+        .find(|r| seen.contains(&r.label) && r.start + r.wait_s + r.run_s + 2 >= since)
+        .map(|r| r.exit)
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -710,6 +834,20 @@ fn main() {
             state(a(1) == Some("--json"));
             0
         }
+        Some("cancel") => match a(1) {
+            Some(label) => cancel(label),
+            None => {
+                eprintln!("usage: machine-slot cancel LABEL");
+                2
+            }
+        },
+        Some("wait") => match a(1) {
+            Some(label) => wait_for(label),
+            None => {
+                eprintln!("usage: machine-slot wait LABEL");
+                2
+            }
+        },
         Some("reopen") => {
             let names = ask::reopen(&state_dir());
             println!(
@@ -739,6 +877,7 @@ fn main() {
             mcp::serve();
             0
         }
+        Some("hook") => hook::main(),
         _ => {
             eprintln!("{HELP}");
             2

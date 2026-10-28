@@ -12,6 +12,10 @@ First public release.
 - A read-only MCP server (`machine-slot mcp`).
 - Claude Code integration: a hook, a skill and an installer.
 - Progress in %: exact when the command writes it to `MACHINE_SLOT_PROGRESS` («37», «0.37», «120/300»), estimated from the usual time otherwise.
+- Runs of a second or less (nothing to do) don't count toward a task's usual time.
 - Live resources per running job — CPU %, memory and disk MB/s of its whole tree — in `status`, `state`, the MCP and the menu bar; each run records its peak CPU and disk MB.
 - `solo --ask`: asks before quitting busy apps for a run and reopens them afterwards (`reopen` finishes the job if machine-slot was killed).
-- A macOS menu bar app with a progress bar per job and an opt-in Open at Login switch.
+- `cancel LABEL` and `wait LABEL`; waiting solos say when they should start.
+- The hook is `machine-slot hook` (milliseconds, no jq) and knows the common build tools; `hook_heavy` / `hook_timed` add more.
+- Linux support (`/proc`, PSI, diskstats).
+- A macOS menu bar app with a progress bar per job, live resources, start times, and opt-in Open at Login and notifications. It reads the queue only when it changes.

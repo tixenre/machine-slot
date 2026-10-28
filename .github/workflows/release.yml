@@ -1,0 +1,69 @@
+name: release
+
+# Push a tag like v0.2.0: builds the binaries and the menu bar app and
+# attaches them to a draft GitHub release, to be checked and published by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: package
+        run: |
+          name=machine-slot-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/machine-slot README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          cp -R integrations "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: machine-slot-*.tar.gz*
+
+  menubar:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Ad-hoc signed: macOS asks to confirm on first open. A Developer ID
+      # signature and notarization need the maintainer's certificate.
+      - run: macos/menubar/build.sh --no-open
+      - run: |
+          cd macos/menubar/build
+          ditto -c -k --keepParent "Machine Slot.app" "../../../Machine-Slot-${GITHUB_REF_NAME}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: menubar
+          path: Machine-Slot-*.zip
+
+  release:
+    needs: [build, menubar]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            machine-slot-*.tar.gz
+            machine-slot-*.tar.gz.sha256
+            Machine-Slot-*.zip

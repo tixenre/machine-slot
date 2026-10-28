@@ -1,4 +1,5 @@
-//! `solo --ask`: when the machine isn't quiet, ask the user whether the
+//! `solo --ask` (macOS; elsewhere it finds no apps and asks nothing): when
+//! the machine isn't quiet, ask the user whether the
 //! busy apps may be quit for the run, and reopen them afterwards. Apps quit
 //! the normal way (they save, and ask about unsaved work themselves);
 //! nothing is ever force-quit. The list of what was closed is kept in the
@@ -292,6 +293,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn live_apps_are_listed() {
         // On a desktop session there is always some Dock app.
         assert!(!running_apps().is_empty());

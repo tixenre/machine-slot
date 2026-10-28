@@ -1,4 +1,5 @@
-//! The Claude Code hook, fed the JSON it gets from Claude Code.
+//! The Claude Code hook (`machine-slot hook` and the script that finds it),
+//! fed the JSON it gets from Claude Code.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -14,8 +15,8 @@ fn decide(cmd: &str, config: &str) -> String {
     std::fs::create_dir_all(dir.join("machine-slot")).unwrap();
     std::fs::write(dir.join("machine-slot/config"), config).unwrap();
     let input = format!("{{\"tool_input\":{{\"command\":{}}}}}", json_str(cmd));
-    let mut p = Command::new("bash")
-        .arg(HOOK)
+    let mut p = Command::new(env!("CARGO_BIN_EXE_machine-slot"))
+        .arg("hook")
         .env("XDG_CONFIG_HOME", &dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -36,10 +37,6 @@ fn json_str(s: &str) -> String {
 
 #[test]
 fn heavy_commands_need_a_turn() {
-    if Command::new("jq").arg("--version").output().is_err() {
-        eprintln!("no jq: skipped");
-        return;
-    }
     let cases = [
         ("cargo test -p store", "deny"),
         ("cd x && cargo build --release", "deny"),
@@ -67,6 +64,18 @@ fn heavy_commands_need_a_turn() {
         ("cargo fmt", "allow"),
         ("ls cargo-tests", "allow"),
         ("mybuild --ui", "allow"),
+        ("make -j8", "deny"),
+        ("cd web && npm test", "deny"),
+        ("go test ./...", "deny"),
+        ("python3 -m pytest -q", "deny"),
+        ("./gradlew assemble", "deny"),
+        ("machine-slot shared \"web: tests\" -- npm test", "allow"),
+        ("go test -bench . ./...", "deny"),
+        ("machine-slot shared b -- go test -bench .", "deny"),
+        ("machine-slot solo b -- go test -bench .", "allow"),
+        ("ls make-targets", "allow"),
+        ("cmake -S . -B out", "allow"),
+        ("npm install", "allow"),
     ];
     for (cmd, want) in cases {
         assert_eq!(decide(cmd, ""), want, "{cmd}");
@@ -77,4 +86,36 @@ fn heavy_commands_need_a_turn() {
         "allow"
     );
     assert_eq!(decide("cargo build", "hook_allow = mybuild\n"), "deny");
+    // More heavy and timed commands from the config.
+    let config = "hook_heavy = ./build.sh, just test\nhook_timed = ./bench.sh\n";
+    assert_eq!(decide("./build.sh --release", config), "deny");
+    assert_eq!(decide("just test", config), "deny");
+    assert_eq!(decide("just fmt", config), "allow");
+    assert_eq!(
+        decide("machine-slot shared x -- ./bench.sh", config),
+        "deny"
+    );
+    assert_eq!(decide("machine-slot solo x -- ./bench.sh", config), "allow");
+    assert_eq!(decide("./build.sh", ""), "allow");
+}
+
+#[test]
+fn the_installed_script_finds_the_binary() {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_machine-slot"));
+    let path = format!("{}:/usr/bin:/bin", bin.parent().unwrap().display());
+    let run = |cmd: &str| {
+        let mut p = Command::new("/bin/sh")
+            .arg(HOOK)
+            .env("PATH", &path)
+            .env("HOME", std::env::temp_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = format!("{{\"tool_input\":{{\"command\":{}}}}}", json_str(cmd));
+        p.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        String::from_utf8(p.wait_with_output().unwrap().stdout).unwrap()
+    };
+    assert!(run("cargo build").contains("\"deny\""));
+    assert_eq!(run("ls"), "");
 }

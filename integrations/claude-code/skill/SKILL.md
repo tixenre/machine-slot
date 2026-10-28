@@ -21,6 +21,7 @@ This machine has one queue for the heavy work of every session. Nobody orchestra
 - `machine-slot status`: what runs, what waits, % done, and the CPU / memory / disk each running job uses.
 - `machine-slot estimate "<label>" [solo|shared]`: the usual time and how long it would wait now.
 - `machine-slot times`, `machine-slot repeats`, `machine-slot log 20`.
+- `machine-slot wait "<label>"` waits for a job and exits as it did; `machine-slot cancel "<label>"` stops your own job cleanly (never someone else's).
 
 ## Rules
 

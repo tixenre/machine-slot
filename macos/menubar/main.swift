@@ -1,7 +1,10 @@
 // Menu bar indicator for machine-slot: what runs, what waits, and how far
-// each one is against its usual time. Reads `machine-slot state` every 2 s.
+// each one is against its usual time. It reads `machine-slot state` when a
+// job comes or goes (it watches the queue's folder) and every 2 s while
+// something runs; with the machine free it does nothing.
 import AppKit
 import ServiceManagement
+import UserNotifications
 
 /// GUI apps don't get the shell's PATH: look where installs usually land.
 let tool: String = {
@@ -23,6 +26,14 @@ func run(_ args: [String]) -> String {
     return String(decoding: data, as: UTF8.self)
 }
 
+/// The queue's folder, as `machine-slot paths` reports it.
+let stateDir: String? = {
+    for line in run(["paths"]).split(separator: "\n") where line.hasPrefix("state") {
+        return line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+    }
+    return nil
+}()
+
 /// The record's folder, as `machine-slot paths` reports it.
 let dataDir: String = {
     for line in run(["paths"]).split(separator: "\n") where line.hasPrefix("data") {
@@ -43,6 +54,8 @@ struct Job {
     let cpu: Double?
     let memory: Int?
     let disk: Double?
+    /// Waiting solos: seconds until its turn, from the usual times ahead.
+    let startsIn: Int?
 
     var running: Bool { kind == "solo" || kind == "shared" }
     var elapsed: Int { start.map { max(0, Int(Date().timeIntervalSince1970) - $0) } ?? 0 }
@@ -53,7 +66,7 @@ func readState() -> [Job] {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         func at(_ i: Int) -> String { i < f.count ? f[i] : "" }
         return Job(kind: at(0), label: at(1), start: Int(at(2)), usual: Int(at(3)), progress: Double(at(5)), measured: at(6) == "measured",
-                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)))
+                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)))
     }
 }
 
@@ -145,6 +158,7 @@ final class Row: NSView {
             case "queued": why = "Queued to run alone" + (place.map { " (#\($0))" } ?? "")
             default: why = "Waits for the job running alone"
             }
+            if let s = j.startsIn { why += " · starts in ~\(clock(s))" }
             if let u = j.usual { why += " · usually ~\(clock(u))" }
             detail.stringValue = why
         }
@@ -156,6 +170,14 @@ final class Bar: NSObject, NSMenuDelegate {
     var jobs: [Job] = []
     var rows: [Row] = []  // live while the menu is open
     var menuOpen = false
+    var watch: DispatchSourceFileSystemObject?
+    var ticks = 0
+    /// Opt-in: a notification when a solo, or anything that ran a minute or
+    /// more, ends.
+    var notify: Bool {
+        get { UserDefaults.standard.bool(forKey: "notify") }
+        set { UserDefaults.standard.set(newValue, forKey: "notify") }
+    }
 
     override init() {
         super.init()
@@ -163,8 +185,52 @@ final class Bar: NSObject, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         refresh()
-        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        watchQueue()
+        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.ticks += 1
+            // Elapsed times and progress move only while something runs; a
+            // slow look now and then covers a missed folder event.
+            if !self.jobs.isEmpty || self.menuOpen || self.ticks % 30 == 0 {
+                self.refresh()
+            }
+            if self.watch == nil, self.ticks % 15 == 0 { self.watchQueue() }
+        }
         RunLoop.main.add(t, forMode: .common)  // keeps ticking while the menu is open
+    }
+
+    /// A job file comes or goes in the queue's folder: look right away.
+    func watchQueue() {
+        guard let dir = stateDir.map({ "\($0)/jobs" }) else { return }
+        let fd = Darwin.open(dir, O_EVTONLY)
+        guard fd >= 0 else { return }  // not made yet: the timer tries again
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            if src.data.contains(.delete) || src.data.contains(.rename) {
+                src.cancel()
+                self.watch = nil
+            }
+            self.refresh()
+        }
+        src.setCancelHandler { Darwin.close(fd) }
+        src.resume()
+        watch = src
+    }
+
+    /// What ended since the last look, said once.
+    func announce(ended: [Job]) {
+        guard notify else { return }
+        let log = run(["log", "10"])
+        for j in ended where j.kind == "solo" || j.elapsed >= 60 {
+            let line = log.split(separator: "\n").last { $0.hasSuffix(j.label) || $0.contains("  \(j.label)  ") }
+            let failed = line.map { !$0.contains("exit 0 ") } ?? false
+            let c = UNMutableNotificationContent()
+            c.title = failed ? "\(j.label) failed" : "\(j.label) finished"
+            c.body = "\(j.kind == "solo" ? "Ran alone" : "Ran shared") for \(clock(j.elapsed))"
+                + (line?.contains("[loaded]") == true ? ", on a busy machine" : "")
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+        }
     }
 
     /// Running first, then the waiting ones in queue order.
@@ -174,7 +240,10 @@ final class Bar: NSObject, NSMenuDelegate {
     }
 
     func refresh() {
+        let before = jobs.filter(\.running)
         jobs = readState()
+        let now = Set(jobs.filter(\.running).map { "\($0.kind)\t\($0.label)\t\($0.start ?? 0)" })
+        announce(ended: before.filter { !now.contains("\($0.kind)\t\($0.label)\t\($0.start ?? 0)") })
         let solo = jobs.first { $0.kind == "solo" }
         let running = jobs.filter(\.running)
         let waiting = jobs.filter { !$0.running }
@@ -246,6 +315,10 @@ final class Bar: NSObject, NSMenuDelegate {
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
+        let note = NSMenuItem(title: "Notify When Work Ends", action: #selector(toggleNotify(_:)), keyEquivalent: "")
+        note.target = self
+        note.state = notify ? .on : .off
+        menu.addItem(note)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -256,6 +329,16 @@ final class Bar: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+
+    @objc func toggleNotify(_ sender: NSMenuItem) {
+        if notify {
+            notify = false
+            return
+        }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, _ in
+            DispatchQueue.main.async { self.notify = ok }
+        }
+    }
 
     @objc func toggleLogin(_ sender: NSMenuItem) {
         do {

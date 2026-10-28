@@ -334,7 +334,7 @@ fn a_running_job_shows_what_it_uses() {
     until(&w, "cpu ");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
-    assert_eq!(f.len(), 10, "{state}");
+    assert_eq!(f.len(), 11, "{state}");
     let cpu: f64 = f[7].parse().unwrap();
     let mem: u64 = f[8].parse().unwrap();
     assert!(cpu > 20.0, "a busy loop shows as busy: {state}");
@@ -349,4 +349,85 @@ fn a_running_job_shows_what_it_uses() {
         at("disk_mb").parse::<u64>().unwrap() >= 30,
         "dd wrote 40 MB: {rec}"
     );
+}
+
+#[test]
+fn short_lived_children_count_toward_live_cpu() {
+    let w = World::new("short");
+    // A build-like tree: a shell running many busy children that each live
+    // a fraction of a second, between the one-second samples.
+    let script = "for i in $(seq 24); do python3 -c 'import time\nt=time.time()+0.25\nwhile time.time()<t: pass'; done";
+    let ok = w
+        .cmd()
+        .args(["shared", "short", "--", "sh", "-c", script])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let rec = std::fs::read_to_string(w.dir.join("rec/runs.tsv")).unwrap();
+    let head: Vec<&str> = rec.lines().next().unwrap().split('\t').collect();
+    let row: Vec<&str> = rec.lines().nth(1).unwrap().split('\t').collect();
+    let at = |name: &str| row[head.iter().position(|h| *h == name).unwrap()];
+    let peak: u64 = at("peak_cpu_pct").parse().unwrap();
+    assert!(
+        peak > 70,
+        "one core busy the whole time, seen as {peak} %: {rec}"
+    );
+}
+
+#[test]
+fn cancel_stops_a_job_by_label_and_wait_follows_it() {
+    let w = World::new("cancel");
+    let mut j = w.job("shared", "long sleep 1a2b3c4d", 30.0);
+    until(&w, "shared: long sleep");
+    let waiter = w
+        .cmd()
+        .args(["wait", "long sleep 1a2b3c4d"])
+        .spawn()
+        .unwrap();
+    // By task key: the commit id doesn't matter.
+    let out = w
+        .cmd()
+        .args(["cancel", "long sleep 9f8e7d6c"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let st = j.wait().unwrap();
+    assert!(!st.success());
+    let waited = waiter.wait_with_output().unwrap();
+    assert_eq!(waited.status.code(), st.code(), "wait exits as the job did");
+    assert!(w.status().contains("free"), "{}", w.status());
+    let rec = std::fs::read_to_string(w.dir.join("rec/runs.tsv")).unwrap();
+    assert!(
+        rec.contains("long sleep 1a2b3c4d"),
+        "the stopped run is recorded"
+    );
+    let none = w.cmd().args(["cancel", "nothing"]).output().unwrap();
+    assert_eq!(none.status.code(), Some(1));
+}
+
+#[test]
+fn a_waiting_solo_says_when_it_starts() {
+    let w = World::new("eta");
+    w.seed("shared", "steady", 20);
+    w.seed("solo", "measure", 30);
+    let mut a = w.job("shared", "steady", 3.0);
+    until(&w, "shared: steady");
+    let mut b = w.job("solo", "measure", 0.2);
+    until(&w, "next solo: measure");
+    let mut c = w.job("solo", "second", 0.2);
+    until(&w, "queued solo: second");
+    let st = w.status();
+    // steady has ~20 s left, then measure's 30 s, each solo with 5 s of settling.
+    assert!(
+        st.contains("measure (waiting for running work to end, starts in ~2"),
+        "{st}"
+    );
+    assert!(st.contains("second (#1, starts in ~"), "{st}");
+    for j in [&mut a, &mut b, &mut c] {
+        assert!(j.wait().unwrap().success());
+    }
 }

@@ -173,6 +173,9 @@ pub struct Usual {
 }
 
 /// Median of the last 5 good runs of this kind, preferring clean ones.
+/// Runs this short or shorter don't count toward a task's usual time.
+const NO_WORK_S: u64 = 1;
+
 pub fn usual(runs: &[Run], mode: &str, key: &str) -> Option<Usual> {
     usual_where(runs, |r| r.mode == mode && r.key == key)
 }
@@ -186,7 +189,13 @@ pub fn usual_for(runs: &[Run], mode: &str, cmd_id: &str, key: &str) -> Option<Us
 }
 
 fn usual_where(runs: &[Run], pick: impl Fn(&Run) -> bool) -> Option<Usual> {
-    let good: Vec<&Run> = runs.iter().filter(|r| pick(r) && r.exit == 0).collect();
+    let mut good: Vec<&Run> = runs.iter().filter(|r| pick(r) && r.exit == 0).collect();
+    // A run of a second or less did no work (everything cached, no test
+    // matched): it says nothing about how long the task takes, unless that's
+    // all the task ever does.
+    if good.iter().any(|r| r.run_s > NO_WORK_S) {
+        good.retain(|r| r.run_s > NO_WORK_S);
+    }
     let last5 = |v: Vec<&Run>| median(v.iter().rev().take(5).map(|r| r.run_s).collect());
     if let Some(secs) = last5(good.iter().copied().filter(|r| r.clean).collect()) {
         return Some(Usual {
@@ -501,11 +510,23 @@ mod tests {
 
     #[test]
     fn usual_is_the_median_of_the_last_five() {
-        let rs: Vec<Run> = [500, 1, 2, 3, 4, 5]
+        let rs: Vec<Run> = [500, 11, 12, 13, 14, 15]
             .iter()
             .map(|&s| run("a", s, 0, true))
             .collect();
-        assert_eq!(usual(&rs, "shared", "a").unwrap().secs, 3);
+        assert_eq!(usual(&rs, "shared", "a").unwrap().secs, 13);
+    }
+
+    #[test]
+    fn runs_that_did_no_work_dont_make_the_usual_time() {
+        let rs: Vec<Run> = [70, 0, 0, 1, 68, 0]
+            .iter()
+            .map(|&s| run("a", s, 0, true))
+            .collect();
+        assert_eq!(usual(&rs, "shared", "a").unwrap().secs, 70);
+        // A task that is always instant is instant.
+        let quick: Vec<Run> = [0, 1, 0].iter().map(|&s| run("q", s, 0, true)).collect();
+        assert_eq!(usual(&quick, "shared", "q").unwrap().secs, 0);
     }
 
     #[test]

@@ -13,13 +13,16 @@ machine-slot: solo «renderer: baseline» waits for a quiet Mac: cpu 34 %, gpu 2
 machine-slot: solo «renderer: baseline»: the Mac is quiet after 18s
 ```
 
-macOS only for now (Apple Silicon and Intel). No daemon, no dependencies.
+macOS (Apple silicon and Intel) and Linux. No daemon, no dependencies.
 
 ## Install
 
 ```bash
-cargo install --git https://github.com/mancino-dev/machine-slot
+cargo install machine-slot                       # from crates.io
+brew install mancino-dev/tap/machine-slot        # Homebrew, with the menu bar app on macOS
 ```
+
+Or take a binary from the [releases](https://github.com/mancino-dev/machine-slot/releases).
 
 Optional:
 
@@ -61,16 +64,18 @@ Waiting can take a while. In scripts and agents, run it in the background.
 
 | command | |
 |---|---|
-| `machine-slot status` | what runs, what waits, time left against the usual time |
+| `machine-slot status` | what runs (% done, CPU / memory / disk right now), what waits and when a waiting solo should start |
 | `machine-slot estimate LABEL [solo\|shared]` | usual time, and how long it would wait now |
 | `machine-slot times` | per task: runs, clean runs, usual time (clean / loaded), last, max, CPU, peak memory |
 | `machine-slot repeats` | tests run more than once, with every label they ran under |
 | `machine-slot log [N]` | the last N runs, one line each |
 | `machine-slot state [--json]` | for scripts and the menu bar |
+| `machine-slot cancel LABEL` | stop a job the way Ctrl-C would: its whole command, recorded, turn freed |
+| `machine-slot wait LABEL` | wait for a job to end; exits as it did |
 | `machine-slot paths` | where the queue, the record and the config live |
 | `machine-slot mcp` | a read-only MCP server on stdio: `status`, `times`, `history`, `estimate` |
 
-The **menu bar app** shows a lock with the time left while a solo runs, a stack with the number of shared jobs, and an hourglass with +N for waiting ones. Its menu lists running and waiting jobs, each with a progress bar (exact when the command reports it through `MACHINE_SLOT_PROGRESS`, estimated from its usual time otherwise) and, while it runs, the CPU, memory and disk its whole process tree is using right now.
+The **menu bar app** shows a lock with the time left while a solo runs, a stack with the number of shared jobs, and an hourglass with +N for waiting ones. Its menu lists running and waiting jobs, each with a progress bar (exact when the command reports it through `MACHINE_SLOT_PROGRESS`, estimated from its usual time otherwise) and, while it runs, the CPU, memory and disk its whole process tree is using right now. Waiting solos say when they should start. It reads the queue only when a job comes or goes, and every 2 s while something runs. Two switches in its menu, both off until you turn them on: **Open at Login**, and **Notify When Work Ends** (a solo, or anything that ran a minute or more; failures and runs on a busy machine are said as such).
 
 ## The record
 
@@ -102,7 +107,10 @@ Every run is one line in `runs.tsv` in the data folder (`machine-slot paths`):
 | key | |
 |---|---|
 | `data_dir` | where the record lives (default `~/.local/share/machine-slot`) |
-| `hook_allow` | for the Claude Code hook: comma-separated tools that take their own turns |
+| `hook_heavy` | for the Claude Code hook: more heavy commands, comma-separated (`./build.sh, just test`) |
+| `hook_timed` | more commands that measure, so they must be `solo` |
+| `hook_allow` | tools that take their own turns |
+| `ask_keep` | apps `--ask` never offers to quit (names or bundle ids) |
 
 The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override the state and data folders. `MACHINE_SLOT_SETTLE=0` skips the wait for quiet (for CI).
 
@@ -111,7 +119,7 @@ The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override t
 `integrations/claude-code/install.sh` sets up Claude Code for the current user:
 
 - **A skill** that teaches any session to use the queue. Telling a session "use machine-slot" is enough.
-- **A PreToolUse hook** that refuses bare `cargo build/test/run/check/clippy/bench`, `xcodebuild`, `swift build/test` and `hyperfine`, with the line to use instead. Benchmarks must be `solo`.
+- **A PreToolUse hook** (`machine-slot hook`, a few milliseconds per command) that refuses bare builds, tests and benchmarks, with the line to use instead: cargo, `xcodebuild`, `swift build/test`, make, ninja, `cmake --build`, meson, go, zig, bazel, gradle, maven, dotnet, npm/pnpm/yarn test and build, pytest, tox, nox and `hyperfine`, plus whatever `hook_heavy` adds. Benchmarks must be `solo`. Quoted text (commit messages, echo) doesn't count.
 - **The MCP server**, so a session can check the queue and estimates before it runs anything.
 
 `--uninstall` removes all three. Other agents can call the CLI or the MCP server the same way.
@@ -121,7 +129,7 @@ The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override t
 - **Jobs:** every job is a file under the state folder. Its owner keeps it locked with `flock` while it lives, so a job that crashes or is killed frees its place by itself, with no stale lock to clean up.
 - **Decisions:** every decision is taken under one lock file. The policy is a single pure function, `sched::decide`, with unit tests.
 - **Running:** the command runs in its own process group. Ctrl-C and TERM go to the whole group, and KILL follows after 10 s.
-- **Measuring:** CPU comes from `getrusage(RUSAGE_CHILDREN)`, memory from `proc_pid_rusage` over the process tree, and the quiet checks from `host_statistics`, `iostat`, IOKit and CoreGraphics.
+- **Measuring:** the run's CPU comes from `getrusage(RUSAGE_CHILDREN)`. Every second, each process of the tree is read for CPU (with its ended children's, so a build's short-lived compilers count), memory and disk; a process that starts and ends between two samples adds its CPU but not its disk. On macOS that's `proc_pid_rusage`, and the quiet checks read `host_statistics`, IOKit and CoreGraphics in place, starting no processes. On Linux it's `/proc` and PSI; there is no general way to read GPU use or keyboard idle time there, so `gpu` and the input part of `screen` aren't checked, and `--ask` finds no apps to ask about.
 
 ## Development
 
