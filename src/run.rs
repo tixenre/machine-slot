@@ -1,7 +1,8 @@
 //! Runs the command in its own process group, samples the memory of its
 //! whole tree and the other work around it, and stops it on Ctrl-C / TERM.
 
-use crate::sys;
+use crate::record::clock;
+use crate::{sched, sys};
 use std::collections::HashMap;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Command;
@@ -46,20 +47,89 @@ pub struct Outcome {
 /// Below this, a second of the tree counts as doing nothing (% of one core).
 const QUIET_CPU_PCT: f64 = 1.0;
 
+/// A tree that did something this recently still works.
+const BUSY_S: u64 = 60;
+/// Extra time a default limit gives a tree that still works, at most.
+const GRACES: u32 = 2;
+
+/// A job's time limit. It warns before the cut, grows when asked
+/// (`machine-slot extend`), and a default one — not a `--timeout` the
+/// caller chose — gives a tree that still works extra time twice
+/// before stopping it: a limit is there for hung jobs, not long ones.
+pub struct Deadline {
+    pub limit: u64,
+    base: u64,
+    grace: bool,
+    graces: u32,
+    warned: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Step {
+    Fine,
+    /// Seconds left before the cut.
+    Warn(u64),
+    /// Seconds added because it still works.
+    Grace(u64),
+    Cut,
+}
+
+impl Deadline {
+    pub fn new(limit: u64, grace: bool) -> Deadline {
+        Deadline {
+            limit,
+            base: limit,
+            grace,
+            graces: 0,
+            warned: false,
+        }
+    }
+
+    pub fn extend(&mut self, by: u64) {
+        self.limit += by;
+        self.warned = false;
+    }
+
+    /// `worked`: seconds of its own run so far; `quiet`: seconds its tree
+    /// has done nothing.
+    pub fn step(&mut self, worked: u64, quiet: u64) -> Step {
+        if worked >= self.limit {
+            if self.grace && quiet < BUSY_S && self.graces < GRACES {
+                self.graces += 1;
+                let add = (self.base / 2).max(300);
+                self.extend(add);
+                return Step::Grace(add);
+            }
+            return Step::Cut;
+        }
+        let left = self.limit - worked;
+        if !self.warned && left <= (self.limit / 10).clamp(60, 300) {
+            self.warned = true;
+            return Step::Warn(left);
+        }
+        Step::Fine
+    }
+
+    pub fn graces_left(&self) -> u32 {
+        if self.grace { GRACES - self.graces } else { 0 }
+    }
+}
+
 /// `others` says how many other slot jobs run right now; asked every few
 /// seconds.
 /// `progress` is handed to the command as `MACHINE_SLOT_PROGRESS`: a file it
 /// may write «37», «37 %» or «120/300» to, for an exact progress bar.
 /// `live` gets, every second, «cpu % \t memory MB \t disk MB/s \t quiet s»
 /// of the tree, the last being how long it has done nothing.
-/// Past `limit` the command is stopped as Ctrl-C would, and the outcome
-/// says it timed out.
+/// Past `limit` (seconds; see `Deadline`) the command is stopped as Ctrl-C
+/// would, and the outcome says it timed out. Next to `job` it reads
+/// `.extend` (seconds to add) and writes `.limit` (when it would stop).
 pub fn run(
     cmd: &[String],
     mode: &str,
     progress: &std::path::Path,
     live: &std::path::Path,
-    limit: Option<Duration>,
+    limit: Option<(Deadline, &str)>,
     job: &std::path::Path,
     mut others: impl FnMut() -> Option<u32>,
 ) -> Outcome {
@@ -105,6 +175,11 @@ pub fn run(
     // shared work done then isn't the solo's, so it's not in its run time
     // nor against its limit.
     let (mut lent, mut lent_since) = (Duration::ZERO, None::<Instant>);
+    let (mut deadline, label) = match limit {
+        Some((d, l)) => (Some(d), l),
+        None => (None, ""),
+    };
+    let (extend_path, limit_path) = (job.with_extension("extend"), job.with_extension("limit"));
     let worked = |lent: Duration, since: Option<Instant>| {
         started.elapsed().saturating_sub(lent + since.map_or(Duration::ZERO, |t| t.elapsed()))
     };
@@ -157,12 +232,54 @@ pub fn run(
                 lent_since.get_or_insert_with(Instant::now);
             }
         }
-        if !timed_out && limit.is_some_and(|l| worked(lent, lent_since) > l) {
-            eprintln!(
-                "machine-slot: past its time limit ({}s): stopping it",
-                limit.unwrap().as_secs()
-            );
-            timed_out = true;
+        if let Some(d) = deadline.as_mut().filter(|_| !timed_out && tick.is_multiple_of(5)) {
+            if let Some(by) = std::fs::read_to_string(&extend_path)
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+            {
+                let _ = std::fs::remove_file(&extend_path);
+                d.extend(by);
+                eprintln!(
+                    "machine-slot: «{label}» got {} more: it stops at {} of its own run",
+                    clock(by),
+                    clock(d.limit)
+                );
+            }
+            let w = worked(lent, lent_since).as_secs();
+            let quiet = quiet_since.elapsed().as_secs();
+            match d.step(w, quiet) {
+                Step::Fine => {}
+                Step::Warn(left) => eprintln!(
+                    "machine-slot: «{label}» reaches its time limit ({}) in {}; \
+                     `machine-slot extend \"{label}\"` gives it 30 min more{}",
+                    clock(d.limit),
+                    clock(left),
+                    if d.graces_left() > 0 { " (if it still works then, it gets extra time anyway)" } else { "" }
+                ),
+                Step::Grace(add) => eprintln!(
+                    "machine-slot: «{label}» still works at its time limit: {} more ({} left); \
+                     say how long it takes with --expect T",
+                    clock(add),
+                    d.graces_left()
+                ),
+                Step::Cut => {
+                    let why = if quiet >= BUSY_S {
+                        format!("after {} without work", clock(quiet))
+                    } else {
+                        "after its extra time".to_string()
+                    };
+                    eprintln!(
+                        "machine-slot: «{label}» stopped at its time limit ({}) {why}; \
+                         a long job says how long it takes: --expect T, or --timeout T (0: none)",
+                        clock(d.limit)
+                    );
+                    timed_out = true;
+                }
+            }
+            if !timed_out {
+                let at = sched::now() + d.limit.saturating_sub(w);
+                let _ = std::fs::write(&limit_path, format!("{at}\n"));
+            }
         }
         let sig = match SIGNALED.load(Ordering::SeqCst) {
             0 if timed_out => sys::SIGTERM,
@@ -182,6 +299,8 @@ pub fn run(
         std::thread::sleep(Duration::from_millis(200));
     };
     let _ = std::fs::remove_file(live);
+    let _ = std::fs::remove_file(&limit_path);
+    let _ = std::fs::remove_file(&extend_path);
     let disk: u64 = seen.values().map(|u| u.disk_read + u.disk_written).sum();
     let (user, system, rss) = sys::children_usage();
     let mb = |b: u64| (b + (1 << 19)) >> 20;
@@ -203,5 +322,36 @@ pub fn run(
         disk_mb: mb(disk),
         peak_cpu_pct: peak_cpu.round() as u64,
         timed_out,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deadline_warns_then_cuts_a_quiet_job() {
+        let mut d = Deadline::new(600, true);
+        assert_eq!(d.step(100, 0), Step::Fine);
+        assert_eq!(d.step(541, 0), Step::Warn(59));
+        assert_eq!(d.step(560, 0), Step::Fine, "warned once");
+        assert_eq!(d.step(600, 120), Step::Cut, "doing nothing: hung");
+    }
+
+    #[test]
+    fn a_default_deadline_gives_a_working_job_extra_time_twice() {
+        let mut d = Deadline::new(600, true);
+        assert_eq!(d.step(600, 3), Step::Grace(300));
+        assert_eq!(d.limit, 900);
+        assert_eq!(d.step(900, 3), Step::Grace(300));
+        assert_eq!(d.step(1200, 3), Step::Cut);
+    }
+
+    #[test]
+    fn a_chosen_timeout_gives_no_grace_but_can_be_extended() {
+        let mut d = Deadline::new(600, false);
+        d.extend(1800);
+        assert_eq!(d.step(600, 0), Step::Fine);
+        assert_eq!(d.step(2400, 0), Step::Cut);
     }
 }

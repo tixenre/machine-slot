@@ -200,7 +200,7 @@ pub fn judge(cmd: &str, config: &dyn Fn(&str) -> Option<String>) -> Verdict {
     Verdict::NeedsShared
 }
 
-const SOLO: &str = "Measurements run alone on this machine: `machine-slot solo [--needs cpu,disk,ram,gpu,screen] \"<project: what you measure>\" -- <command>` (default cpu,disk,ram; add gpu for GPU work, screen for UI tests). It waits for its turn and a quiet machine, so run it in the background. Use the same label for the same task. See `machine-slot --help`.";
+const SOLO: &str = "Measurements run alone on this machine: `machine-slot solo [--needs cpu,disk,ram,gpu,screen] \"<project: what you measure>\" -- <command>` (default cpu,disk,ram; add gpu for GPU work, screen for UI tests). It waits for its turn and a quiet machine, so run it in the background. Use the same label for the same task. A solo stops at 3 × its usual time (10 min at least, 30 min on a first run): for anything longer, or a bench that changed, say how long it takes with `--expect 25m`. See `machine-slot --help`.";
 const SHARED: &str = "Heavy work goes through the machine queue: `machine-slot shared \"<project: task>\" -- <command>` (runs alongside other work, never during a measurement). To measure time or resources use `machine-slot solo [--needs cpu,disk,ram,gpu,screen] ...`. Same label for the same task; run it in the background if it may wait. `machine-slot status` / `machine-slot estimate LABEL` show the queue.";
 
 /// Reads the hook's JSON on stdin; prints a deny decision when needed.

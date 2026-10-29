@@ -63,7 +63,10 @@ struct Job {
     let settlingOn: String
     /// Where it was started from: «folder · branch».
     let owner: String
+    /// Running with a time limit: when it would be stopped.
+    let limitAt: Int?
 
+    var limitIn: Int? { limitAt.map { max(0, $0 - Int(Date().timeIntervalSince1970)) } }
     var running: Bool { kind == "solo" || kind == "shared" || kind == "yielding" }
     var elapsed: Int { start.map { max(0, Int(Date().timeIntervalSince1970) - $0) } ?? 0 }
 }
@@ -73,7 +76,7 @@ func readState() -> [Job] {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         func at(_ i: Int) -> String { i < f.count ? f[i] : "" }
         return Job(kind: at(0), label: at(1), start: Int(at(2)), usual: Int(at(3)), progress: Double(at(5)), measured: at(6) == "measured",
-                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)), settlingSince: Int(at(12)), settlingOn: at(13), owner: at(14))
+                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)), settlingSince: Int(at(12)), settlingOn: at(13), owner: at(14), limitAt: Int(at(15)))
     }
 }
 
@@ -110,6 +113,7 @@ final class Row: NSView {
     let spinner = NSProgressIndicator()
     let detail = NSTextField(labelWithString: "")
     let usage = NSTextField(labelWithString: "")
+    let warn = NSTextField(labelWithString: "")
     let stack = NSStackView()
     /// What its actions submenu was made for.
     var actionsFor = ""
@@ -127,12 +131,15 @@ final class Row: NSView {
         usage.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         usage.textColor = .tertiaryLabelColor
         usage.lineBreakMode = .byTruncatingTail
+        warn.font = .systemFont(ofSize: 11, weight: .medium)
+        warn.textColor = .systemOrange
+        warn.lineBreakMode = .byTruncatingTail
         icon.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
         icon.contentTintColor = .secondaryLabelColor
         spinner.style = .bar
         spinner.controlSize = .small
         spinner.isIndeterminate = true
-        for f in [title, owner, detail, usage] {
+        for f in [title, owner, detail, usage, warn] {
             f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
 
@@ -149,7 +156,7 @@ final class Row: NSView {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 2
-        for v in [head, owner, meter, spinner, detail, usage] as [NSView] {
+        for v in [head, owner, meter, spinner, detail, usage, warn] as [NSView] {
             stack.addArrangedSubview(v)
         }
         stack.setCustomSpacing(4, after: owner)
@@ -166,6 +173,7 @@ final class Row: NSView {
             owner.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
             detail.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
             usage.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            warn.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
         ])
     }
 
@@ -197,6 +205,11 @@ final class Row: NSView {
         meter.isHidden = true
         spinner.isHidden = true
         usage.isHidden = true
+        warn.isHidden = true
+        if let l = j.limitIn, l <= 300 {
+            warn.stringValue = "Stops at its time limit in \(clock(l)) · More Time in its … menu"
+            warn.isHidden = false
+        }
         defer { fit() }
 
         if j.kind == "yielding" {
@@ -287,6 +300,8 @@ final class Bar: NSObject, NSMenuDelegate {
     var jobs: [Job] = []
     var rows: [Row] = []  // live while the menu is open
     var menuOpen = false
+    /// Jobs already told about nearing their time limit.
+    var warned: Set<String> = []
     var watch: DispatchSourceFileSystemObject?
     var ticks = 0
     /// Opt-in: a notification when a solo, or anything that ran a minute or
@@ -350,6 +365,21 @@ final class Bar: NSObject, NSMenuDelegate {
         }
     }
 
+    /// A job about to be stopped at its time limit: said once, so it can
+    /// be given more before it's cut.
+    func warnNearLimit() {
+        let near = jobs.filter { $0.running && ($0.limitIn ?? .max) <= 300 }
+        warned = warned.intersection(near.map(\.label))
+        guard notify else { return }
+        for j in near where !warned.contains(j.label) {
+            warned.insert(j.label)
+            let c = UNMutableNotificationContent()
+            c.title = "\(j.label) stops soon"
+            c.body = "Its time limit is in \(clock(j.limitIn ?? 0)). 30 More Minutes is in its … menu."
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+        }
+    }
+
     /// Running first, then the waiting ones in queue order.
     func ordered() -> [Job] {
         let rank = ["solo": 0, "shared": 1, "draining": 2, "queued": 3, "waiting": 4]
@@ -361,6 +391,7 @@ final class Bar: NSObject, NSMenuDelegate {
         jobs = readState()
         let now = Set(jobs.filter(\.running).map { "\($0.kind)\t\($0.label)\t\($0.start ?? 0)" })
         announce(ended: before.filter { !now.contains("\($0.kind)\t\($0.label)\t\($0.start ?? 0)") })
+        warnNearLimit()
         let solo = jobs.first { $0.kind == "solo" }
         let running = jobs.filter(\.running)
         let waiting = jobs.filter { !$0.running }
@@ -394,7 +425,7 @@ final class Bar: NSObject, NSMenuDelegate {
             row.show(j, place: j.kind == "queued" ? place : nil)
             // Its actions follow it from waiting to running; left alone
             // otherwise, so an open one doesn't close.
-            let key = "\(j.label)\t\(j.running)\t\(j.settlingSince != nil)"
+            let key = "\(j.label)\t\(j.running)\t\(j.settlingSince != nil)\t\(j.limitAt != nil)"
             if row.actionsFor != key {
                 row.actionsFor = key
                 row.enclosingMenuItem?.submenu = actions(j)
@@ -457,12 +488,33 @@ final class Bar: NSObject, NSMenuDelegate {
             go.representedObject = j.label
             m.addItem(go)
         }
+        if j.running, j.limitAt != nil {
+            let more = NSMenuItem(title: "30 More Minutes", action: #selector(moreTime(_:)), keyEquivalent: "")
+            more.image = NSImage(systemSymbolName: "clock.badge.plus", accessibilityDescription: nil)
+            more.target = self
+            more.representedObject = j.label
+            m.addItem(more)
+        }
         let stop = NSMenuItem(title: j.running ? "Stop" : "Remove from Queue", action: #selector(stop(_:)), keyEquivalent: "")
         stop.image = NSImage(systemSymbolName: j.running ? "stop.fill" : "xmark", accessibilityDescription: nil)
         stop.target = self
         stop.representedObject = j.label
         m.addItem(stop)
         return m
+    }
+
+    /// `machine-slot extend`: its runner moves the limit within a second.
+    @objc func moreTime(_ sender: NSMenuItem) {
+        guard let label = sender.representedObject as? String else { return }
+        if run(["extend", label]).isEmpty {
+            let fail = NSAlert()
+            fail.messageText = "Couldn't give «\(label)» more time"
+            fail.informativeText = "See `machine-slot extend \"\(label)\"` in a terminal."
+            NSApp.activate(ignoringOtherApps: true)
+            fail.runModal()
+        }
+        warned.remove(label)
+        refresh()
     }
 
     /// `machine-slot cancel`: stopped as Ctrl-C would stop it.

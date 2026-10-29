@@ -4,6 +4,7 @@
 
 First public release.
 
+- Long jobs: `--expect T` wins over history; a warning before a time limit (output, `status`, menu bar notification); `machine-slot extend LABEL [--by T]` and 30 More Minutes in the menu; a default limit gives a job that still works extra time twice.
 - Menu bar: each job has its own «…» menu: Start Now or Remove from Queue while it waits, Stop while it runs (each asks first).
 - Menu bar: SF Symbols, owner on its own line, shorter times, no empty gaps, blue bar when measured; usage in cores («3.5 of 10 cores»), in `status` too.
 - Time a solo lends with `yield` no longer counts in its run time or against its limit.

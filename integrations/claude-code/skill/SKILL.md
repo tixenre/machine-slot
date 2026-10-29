@@ -17,7 +17,8 @@ This machine has one queue for the heavy work of every session. Nobody orchestra
 - **Time limits:** a solo stops at 3 × its usual time by default; give a known-long or hang-prone run `--timeout 30m` (or `0` for none). Exit 124 means it timed out.
 - **Later:** `--at 23:30` queues a long solo for later without blocking anyone now.
 - **Long solos are shared time.** Everything else waits while a solo runs. For a bench or baseline that takes minutes:
-  - the first time, say how long you expect it to take: `--expect 15m` (without history or `--timeout`, a solo stops at 30 min);
+  - **say how long it takes** whenever it may pass 10 min, or the bench changed since its last runs: `--expect 25m`. It wins over history, and the limit becomes 3 × that. Without it a solo stops at 3 × its usual time (10 min at least; 30 min on a first run), and only gets extra time if it's still working;
+  - near the cut, machine-slot warns in the job's output; `machine-slot extend "<label>" [--by 30m]` gives it more;
   - report progress from the script: `echo "3/8" > "$MACHINE_SLOT_PROGRESS"` after each pass;
   - between independent passes, call `machine-slot yield` (default 3 min, `--for 5m`): waiting builds that fit run, the machine calms down again, and your script goes on — your measurements stay clean.
 - **Forcing:** `machine-slot go "<label>"` starts a waiting job now. Only when the user asks: it spoils a running solo's measurement (recorded as not clean).

@@ -65,6 +65,8 @@ pub struct Job {
     pub live: Option<(f64, u64, f64)>,
     /// While it runs: seconds its tree has used no CPU and no disk.
     pub quiet_s: Option<u64>,
+    /// While it runs with a time limit: when it would be stopped.
+    pub limit_at: Option<u64>,
     /// A solo waiting for a quiet machine: since when, and what isn't quiet.
     pub settling: Option<(u64, String)>,
     /// Where it was started from: «folder · branch», or MACHINE_SLOT_OWNER.
@@ -101,6 +103,7 @@ impl Job {
             loaded: false,
             progress: None,
             live: None,
+            limit_at: None,
             quiet_s: None,
             settling: None,
             owner: String::new(),
@@ -120,6 +123,7 @@ impl Job {
             loaded: m.get("loaded") == Some(&"1"),
             progress: None,
             live: None,
+            limit_at: None,
             quiet_s: None,
             settling: None,
             owner: m.get("owner").unwrap_or(&"").to_string(),
@@ -255,7 +259,7 @@ pub fn live(dir: &Path) -> Vec<Job> {
         let Ok(f) = File::open(&path) else { continue };
         // Getting the lock means nobody holds it: the owner is dead.
         if f.try_lock().is_ok() {
-            for ext in ["job", "progress", "live", "calm", "go", "yield"] {
+            for ext in ["job", "progress", "live", "calm", "go", "yield", "limit", "extend"] {
                 let _ = fs::remove_file(path.with_extension(ext));
             }
             continue;
@@ -278,6 +282,9 @@ pub fn live(dir: &Path) -> Vec<Job> {
                     let (since, what) = t.trim().split_once('\t')?;
                     Some((since.parse().ok()?, what.to_string()))
                 });
+            j.limit_at = fs::read_to_string(path.with_extension("limit"))
+                .ok()
+                .and_then(|t| t.trim().parse().ok());
             j.quiet_s = fs::read_to_string(path.with_extension("live"))
                 .ok()
                 .and_then(|t| t.trim().split('\t').nth(3)?.parse().ok());
@@ -344,6 +351,7 @@ impl Slot {
             loaded: usual.is_some_and(|u| u.1),
             progress: None,
             live: None,
+            limit_at: None,
             quiet_s: None,
             settling: None,
             owner: owner.to_string(),
@@ -482,6 +490,8 @@ impl Drop for Slot {
         let _ = fs::remove_file(self.calm_path());
         let _ = fs::remove_file(self.path.with_extension("go"));
         let _ = fs::remove_file(self.yield_path());
+        let _ = fs::remove_file(self.path.with_extension("limit"));
+        let _ = fs::remove_file(self.path.with_extension("extend"));
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -502,6 +512,7 @@ mod tests {
             loaded: false,
             progress: None,
             live: None,
+            limit_at: None,
             quiet_s: None,
             settling: None,
             owner: String::new(),
@@ -618,6 +629,7 @@ mod tests {
             loaded: true,
             progress: None,
             live: None,
+            limit_at: None,
             quiet_s: None,
             settling: None,
             owner: String::new(),

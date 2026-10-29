@@ -28,14 +28,19 @@ machine-slot solo [--needs LIST] [--ask] LABEL -- CMD…
                                    --timeout T: stop it after T (90s, 20m, 1h30m); a
                                    solo without one stops at 3 × its usual time
                                    (10 min at least); 0: no limit.
-                                   --expect T: how long it should take, until it
-                                   has history (a first run without it or
-                                   --timeout stops at 30 min).
+                                   --expect T: how long it should take; it wins
+                                   over history (a bench that changed), and the
+                                   limit becomes 3 × T. A first run without it
+                                   or --timeout stops at 30 min. Before a cut it
+                                   warns; a default limit gives a job that still
+                                   works extra time twice.
                                    --at HH:MM: join the queue only then (it holds
                                    nothing until then), e.g. a long solo for tonight.
 machine-slot shared LABEL -- CMD…  together with other shared work, never during a solo.
                                    While a solo waits, it starts only if its usual time
                                    ends before the running work does.
+machine-slot extend LABEL [--by T]
+                                   more time for a running job (default 30m)
 machine-slot status                what runs, what waits, how long is left
 machine-slot times                 how long each kind of task takes (clean / loaded)
 machine-slot log [N]               the last N runs
@@ -114,6 +119,17 @@ fn left(j: &Job, now: u64) -> String {
 pub const STALLED_S: u64 = 300;
 
 /// «cpu 340 % · 2.1 GB · disk 12 MB/s», while it runs.
+/// Within 5 minutes of its time limit: when, and how to give it more.
+pub fn limit_text(j: &Job, now: u64) -> String {
+    match j.limit_at {
+        Some(at) if at.saturating_sub(now) <= 300 => format!(
+            " · time limit in {} (machine-slot extend)",
+            clock(at.saturating_sub(now))
+        ),
+        _ => String::new(),
+    }
+}
+
 pub fn live_text(j: &Job) -> String {
     match j.live {
         Some((cpu, mem, disk)) => {
@@ -205,9 +221,21 @@ pub fn status_text(jobs: &[Job]) -> String {
                     j.label,
                     clock(now.saturating_sub(*since))
                 ),
-                None => format!("solo: {} ({}{})", j.label, left(j, now), live_text(j)),
+                None => format!(
+                    "solo: {} ({}{}{})",
+                    j.label,
+                    left(j, now),
+                    live_text(j),
+                    limit_text(j, now)
+                ),
             },
-            Kind::Shared => format!("shared: {} ({}{})", j.label, left(j, now), live_text(j)),
+            Kind::Shared => format!(
+                "shared: {} ({}{}{})",
+                j.label,
+                left(j, now),
+                live_text(j),
+                limit_text(j, now)
+            ),
             Kind::Yielding => format!(
                 "solo: {} (lending the machine, back in ~{})",
                 j.label,
@@ -862,10 +890,11 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
         &state_dir(),
         solo,
         &label,
-        usual
-            .zip(usual_now)
-            .map(|(u, now)| (now, u.loaded))
-            .or(opts.expect.map(|e| (e, false))),
+        // Said for this run, it wins over the history: the task may have
+        // changed under the same label.
+        opts.expect
+            .map(|e| (e, false))
+            .or(usual.zip(usual_now).map(|(u, now)| (now, u.loaded))),
         &id.owner,
     ) {
         Ok(s) => s,
@@ -956,7 +985,7 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
     let start = sched::now();
     let progress = slot.progress_path();
     let live = slot.live_path();
-    let limit = time_limit(solo, opts.timeout, usual.map(|u| u.secs).or(opts.expect));
+    let limit = time_limit(solo, opts.timeout, opts.expect.or(usual.map(|u| u.secs)));
     if solo && limit == Some(1800) && opts.timeout.is_none() && usual.is_none() {
         eprintln!(
             "machine-slot: first run of «{label}»: it stops at 30 min unless given --timeout (or --expect)"
@@ -969,7 +998,7 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
         mode,
         &progress,
         &live,
-        limit.map(Duration::from_secs),
+        limit.map(|l| (run::Deadline::new(l, opts.timeout.is_none()), label.as_str())),
         &job_path,
         || lender.tick(&mut slot),
     );
@@ -1085,6 +1114,12 @@ fn state(json: bool) {
                             .unwrap_or(json::Json::Null),
                     ),
                     ("loaded", json::Json::Bool(j.loaded)),
+                    (
+                        "stops_at",
+                        j.limit_at
+                            .map(|t| json::Json::Num(t as f64))
+                            .unwrap_or(json::Json::Null),
+                    ),
                     ("pid", json::Json::Num(j.pid as f64)),
                     (
                         "progress",
@@ -1127,7 +1162,7 @@ fn state(json: bool) {
         for j in &jobs {
             let f = fraction(j, sched::now());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 j.kind.name(),
                 j.label,
                 j.start,
@@ -1147,7 +1182,8 @@ fn state(json: bool) {
                     .as_ref()
                     .map(|(since, what)| format!("{}\t{what}", since))
                     .unwrap_or_else(|| "\t".into()),
-                j.owner
+                j.owner,
+                j.limit_at.map(|t| t.to_string()).unwrap_or_default()
             );
         }
     }
@@ -1178,6 +1214,45 @@ fn cancel(label: &str) -> i32 {
         1 => {
             sys::send(jobs[0].pid, sys::SIGTERM);
             println!("stopping «{}» ({})", jobs[0].label, jobs[0].kind.name());
+            0
+        }
+        _ => {
+            eprintln!(
+                "machine-slot: «{label}» names {} jobs; use the exact label:",
+                jobs.len()
+            );
+            for j in &jobs {
+                eprintln!("  {}", j.label);
+            }
+            1
+        }
+    }
+}
+
+/// More time for a running job's limit: its runner picks it up within a
+/// second.
+fn extend(label: &str, by: u64) -> i32 {
+    let jobs: Vec<Job> = named(label).into_iter().filter(|j| j.limit_at.is_some()).collect();
+    match jobs.len() {
+        0 => {
+            eprintln!("machine-slot: no running job «{label}» with a time limit");
+            1
+        }
+        1 => {
+            let j = &jobs[0];
+            let path = state_dir().join("jobs").join(format!("{}.extend", j.id));
+            let had: u64 = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+                .unwrap_or(0);
+            let tmp = path.with_extension("extend.tmp");
+            if std::fs::write(&tmp, format!("{}\n", had + by)).is_err()
+                || std::fs::rename(&tmp, &path).is_err()
+            {
+                eprintln!("machine-slot: can't write {}", path.display());
+                return 2;
+            }
+            println!("«{}» gets {} more", j.label, clock(by));
             0
         }
         _ => {
@@ -1353,6 +1428,26 @@ fn main() {
             state(a(1) == Some("--json"));
             0
         }
+        Some("extend") => match a(1) {
+            Some(label) => {
+                let by = match (a(2), a(3)) {
+                    (None, _) => Some(1800),
+                    (Some("--by"), Some(t)) => parse_duration(t).filter(|&t| t > 0),
+                    _ => None,
+                };
+                match by {
+                    Some(by) => extend(label, by),
+                    None => {
+                        eprintln!("usage: machine-slot extend LABEL [--by T]");
+                        2
+                    }
+                }
+            }
+            None => {
+                eprintln!("usage: machine-slot extend LABEL [--by T]");
+                2
+            }
+        },
         Some("cancel") => match a(1) {
             Some(label) => cancel(label),
             None => {

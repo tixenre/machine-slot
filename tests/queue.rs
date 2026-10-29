@@ -338,7 +338,7 @@ fn a_running_job_shows_what_it_uses() {
     until(&w, " cores");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
-    assert_eq!(f.len(), 15, "{state}");
+    assert_eq!(f.len(), 16, "{state}");
     let cpu: f64 = f[7].parse().unwrap();
     let mem: u64 = f[8].parse().unwrap();
     assert!(cpu > 20.0, "a busy loop shows as busy: {state}");
@@ -626,4 +626,38 @@ fn runs_in_a_repo_record_its_commit_and_branch() {
     let row: Vec<&str> = rec.lines().nth(1).unwrap().split('\t').collect();
     let commit = row[head.iter().position(|h| *h == "head").unwrap()];
     assert!(commit.len() >= 7, "commit on record: {rec}");
+}
+
+#[test]
+fn extend_gives_a_running_job_more_time() {
+    let w = World::new("extend");
+    let mut j = w
+        .cmd()
+        .args(["shared", "slow", "--timeout", "3s", "--", "sleep", "5"])
+        .spawn()
+        .unwrap();
+    until(&w, "time limit in");
+    let ok = (0..20).any(|_| {
+        let done = w.cmd().args(["extend", "slow", "--by", "10s"]).status().unwrap().success();
+        if !done {
+            pause(50);
+        }
+        done
+    });
+    assert!(ok, "extend found no job: {}", w.status());
+    assert_eq!(j.wait().unwrap().code(), Some(0), "it ran past its 3 s");
+}
+
+#[test]
+fn expect_wins_over_history() {
+    // The bench under this label changed: the old ~1 s isn't its time now.
+    let w = World::new("expect-history");
+    w.seed("shared", "bench", 1);
+    let mut j = w
+        .cmd()
+        .args(["shared", "bench", "--expect", "40s", "--", "sleep", "2"])
+        .spawn()
+        .unwrap();
+    until(&w, "of ~40s");
+    assert!(j.wait().unwrap().success());
 }
