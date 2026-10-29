@@ -321,20 +321,24 @@ fn a_running_job_shows_what_it_uses() {
     let w = World::new("live");
     // One process that writes 40 MB to disk, then keeps a core busy: it's
     // alive at the samples, so both show.
-    let script = "import os, tempfile, time\n\
-                  fd, p = tempfile.mkstemp()\n\
-                  os.write(fd, b'x' * (40 << 20)); os.fsync(fd); os.close(fd); os.remove(p)\n\
-                  t = time.time() + 4\n\
-                  while time.time() < t: pass\n";
+    // On a real disk: the temp folder may be in memory (tmpfs on Linux).
+    let script = format!(
+        "import os, tempfile, time\n\
+         fd, p = tempfile.mkstemp(dir={:?})\n\
+         os.write(fd, b'x' * (40 << 20)); os.fsync(fd); os.close(fd); os.remove(p)\n\
+         t = time.time() + 4\n\
+         while time.time() < t: pass\n",
+        env!("CARGO_TARGET_TMPDIR")
+    );
     let mut j = w
         .cmd()
-        .args(["shared", "busy", "--", "python3", "-c", script])
+        .args(["shared", "busy", "--", "python3", "-c", &script])
         .spawn()
         .unwrap();
     until(&w, "cpu ");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
-    assert_eq!(f.len(), 11, "{state}");
+    assert_eq!(f.len(), 12, "{state}");
     let cpu: f64 = f[7].parse().unwrap();
     let mem: u64 = f[8].parse().unwrap();
     assert!(cpu > 20.0, "a busy loop shows as busy: {state}");
@@ -428,6 +432,64 @@ fn a_waiting_solo_says_when_it_starts() {
     );
     assert!(st.contains("second (#1, starts in ~"), "{st}");
     for j in [&mut a, &mut b, &mut c] {
+        assert!(j.wait().unwrap().success());
+    }
+}
+
+#[test]
+fn a_job_past_its_time_limit_is_stopped_and_recorded() {
+    let w = World::new("timeout");
+    let t = Instant::now();
+    let st = w
+        .cmd()
+        .args(["shared", "hang", "--timeout", "2s", "--", "sleep", "60"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(st.code(), Some(124));
+    assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+    let rec = std::fs::read_to_string(w.dir.join("rec/runs.tsv")).unwrap();
+    let head: Vec<&str> = rec.lines().next().unwrap().split('\t').collect();
+    let row: Vec<&str> = rec.lines().nth(1).unwrap().split('\t').collect();
+    assert_eq!(
+        row[head.iter().position(|h| *h == "timed_out").unwrap()],
+        "1"
+    );
+    assert!(w.status().contains("free"));
+}
+
+#[test]
+fn a_quiet_job_says_for_how_long() {
+    let w = World::new("quiet");
+    let mut j = w.job("shared", "idle", 5.0);
+    until(&w, "shared: idle");
+    pause(3500);
+    let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
+    let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
+    let quiet: u64 = f[11].parse().unwrap();
+    assert!(quiet >= 2, "a sleeping job does nothing: {state}");
+    assert!(j.wait().unwrap().success());
+}
+
+#[test]
+fn waiting_shared_work_says_when_it_starts() {
+    let w = World::new("eta-shared");
+    w.seed("solo", "measure", 30);
+    w.seed("shared", "build", 10);
+    let mut a = w.job("solo", "measure", 3.0);
+    until(&w, "solo: measure");
+    let mut b = w.job("shared", "build", 0.2);
+    until(&w, "waiting shared: build (starts in ~");
+    let est = String::from_utf8(
+        w.cmd()
+            .args(["estimate", "build", "shared"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(est.contains("wait now: ~"), "{est}");
+    for j in [&mut a, &mut b] {
         assert!(j.wait().unwrap().success());
     }
 }

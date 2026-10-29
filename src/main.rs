@@ -25,6 +25,11 @@ machine-slot solo [--needs LIST] [--ask] LABEL -- CMD…
                                    it ends (benches, baselines, UI tests). One queue.
                                    --ask: if apps keep the Mac busy, ask the user whether
                                    to quit them for the run; they reopen afterwards.
+                                   --timeout T: stop it after T (90s, 20m, 1h30m); a
+                                   solo without one stops at 3 × its usual time
+                                   (10 min at least); 0: no limit.
+                                   --at HH:MM: join the queue only then (it holds
+                                   nothing until then), e.g. a long solo for tonight.
 machine-slot shared LABEL -- CMD…  together with other shared work, never during a solo.
                                    While a solo waits, it starts only if its usual time
                                    ends before the running work does.
@@ -94,6 +99,9 @@ fn left(j: &Job, now: u64) -> String {
     }
 }
 
+/// A running tree this long without CPU or disk is shown as maybe stalled.
+pub const STALLED_S: u64 = 300;
+
 /// «cpu 340 % · 2.1 GB · disk 12 MB/s», while it runs.
 pub fn live_text(j: &Job) -> String {
     match j.live {
@@ -108,7 +116,13 @@ pub fn live_text(j: &Job) -> String {
             } else {
                 String::new()
             };
-            format!(" · cpu {cpu:.0} % · {mem}{disk}")
+            // UI tests drive an app outside the tree, so a quiet tree is a
+            // question, not a verdict.
+            let quiet = match j.quiet_s {
+                Some(q) if q >= STALLED_S => format!(" · nothing for {} (stalled?)", clock(q)),
+                _ => String::new(),
+            };
+            format!(" · cpu {cpu:.0} % · {mem}{disk}{quiet}")
         }
         None => String::new(),
     }
@@ -124,27 +138,33 @@ fn remaining(j: &Job, now: u64) -> Option<u64> {
     j.usual.map(|u| u.saturating_sub(el))
 }
 
-/// The seconds a waiting solo should wait for its turn: the running work,
-/// then every solo ahead of it, each with its few seconds of settling.
+/// The seconds a waiting job should wait for its turn. A solo waits for
+/// the running work, then for every solo ahead of it, each with its few
+/// seconds of settling. A waiting shared job goes after every solo.
 pub fn starts_in(jobs: &[Job], j: &Job, now: u64) -> Option<u64> {
     const SETTLE_S: u64 = 5;
-    if !matches!(j.kind, Kind::Draining | Kind::Queued) {
-        return None;
-    }
+    let solo = match j.kind {
+        Kind::Draining | Kind::Queued => true,
+        Kind::Waiting => false,
+        _ => return None,
+    };
     let mut wait = 0;
-    for r in jobs
-        .iter()
-        .filter(|r| matches!(r.kind, Kind::Solo | Kind::Shared))
-    {
+    for r in jobs.iter().filter(|r| match r.kind {
+        Kind::Solo => true,
+        // A shared job waiting behind solos doesn't wait for running shared
+        // work unless a solo has to drain it first.
+        Kind::Shared => solo || jobs.iter().any(|a| a.kind == Kind::Draining),
+        _ => false,
+    }) {
         wait = wait.max(remaining(r, now)?);
     }
-    for ahead in jobs
-        .iter()
-        .filter(|a| matches!(a.kind, Kind::Draining | Kind::Queued) && a.ticket < j.ticket)
-    {
-        wait += SETTLE_S + ahead.usual?;
+    let ahead = jobs.iter().filter(|a| {
+        matches!(a.kind, Kind::Draining | Kind::Queued) && (!solo || a.ticket < j.ticket)
+    });
+    for a in ahead {
+        wait += SETTLE_S + a.usual?;
     }
-    Some(wait + SETTLE_S)
+    Some(if solo { wait + SETTLE_S } else { wait })
 }
 
 pub fn status_text(jobs: &[Job]) -> String {
@@ -159,14 +179,27 @@ pub fn status_text(jobs: &[Job]) -> String {
             place += 1;
         }
         let line = match j.kind {
-            Kind::Solo => format!("solo: {} ({}{})", j.label, left(j, now), live_text(j)),
+            Kind::Solo => match &j.settling {
+                Some((since, what)) => format!(
+                    "solo: {} (waiting {} for a quiet machine: {what})",
+                    j.label,
+                    clock(now.saturating_sub(*since))
+                ),
+                None => format!("solo: {} ({}{})", j.label, left(j, now), live_text(j)),
+            },
             Kind::Shared => format!("shared: {} ({}{})", j.label, left(j, now), live_text(j)),
             Kind::Draining => format!(
                 "next solo: {} (waiting for running work to end{eta})",
                 j.label
             ),
             Kind::Queued => format!("queued solo: {} (#{place}{eta})", j.label),
-            Kind::Waiting => format!("waiting shared: {}", j.label),
+            Kind::Waiting => format!(
+                "waiting shared: {}{}",
+                j.label,
+                starts_in(jobs, j, now)
+                    .map(|s| format!(" (starts in ~{})", clock(s)))
+                    .unwrap_or_default()
+            ),
         };
         out.push_str(&line);
         out.push('\n');
@@ -180,47 +213,45 @@ pub fn estimate_text(label: &str, mode: &str) -> String {
     let jobs = sched::peek(&state_dir());
     let now = sched::now();
     let usual = record::usual(&runs, mode, &key);
-    let busy_until = |kinds: &[Kind]| -> Option<u64> {
-        let mut end = now;
-        for j in jobs.iter().filter(|j| kinds.contains(&j.kind)) {
-            end = end.max(j.start + j.usual?);
-        }
-        Some(end)
-    };
-    let wait = match mode {
-        "solo" => busy_until(&[Kind::Solo, Kind::Shared]).map(|e| e - now),
-        _ if jobs
-            .iter()
-            .any(|j| matches!(j.kind, Kind::Solo | Kind::Queued | Kind::Draining)) =>
-        {
-            busy_until(&[Kind::Solo, Kind::Shared]).map(|e| e - now)
-        }
-        _ => Some(0),
-    };
-    let queued = jobs
+    let (load, cpus) = (sys::load1(), sys::cpus() as f64);
+    // As if it joined the queue now: a solo behind every solo, a shared job
+    // after them all, or right away when no solo is around.
+    let solos = jobs
         .iter()
-        .filter(|j| matches!(j.kind, Kind::Queued | Kind::Draining))
-        .count();
+        .any(|j| matches!(j.kind, Kind::Solo | Kind::Queued | Kind::Draining));
+    let me = Job {
+        kind: if mode == "solo" {
+            if solos { Kind::Queued } else { Kind::Draining }
+        } else {
+            Kind::Waiting
+        },
+        ticket: u64::MAX,
+        ..Job::blank()
+    };
+    let wait = if mode != "solo" && !solos {
+        Some(0)
+    } else {
+        starts_in(&jobs, &me, now)
+    };
     format!(
-        "task: {key} ({mode})\nusual: {}\nwait now: {}{}\n",
+        "task: {key} ({mode})\nusual: {}\nwait now: {}\n",
         usual
-            .map(|u| format!(
-                "~{}{}",
-                clock(u.secs),
+            .map(|u| {
                 if u.loaded {
-                    " (only loaded runs: an upper bound)"
+                    format!("~{} (only loaded runs: an upper bound)", clock(u.secs))
+                } else if mode == "solo" || u.now(load, cpus) == u.secs {
+                    format!("~{}", clock(u.secs))
                 } else {
-                    ""
+                    format!(
+                        "~{} at today's load (~{} on a free machine)",
+                        clock(u.now(load, cpus)),
+                        clock(u.secs)
+                    )
                 }
-            ))
+            })
             .unwrap_or_else(|| "no history".into()),
         wait.map(|w| format!("~{}", clock(w)))
-            .unwrap_or_else(|| "unknown (running work without history)".into()),
-        if queued > 0 {
-            format!(" ({queued} solo queued, not counted)")
-        } else {
-            String::new()
-        }
+            .unwrap_or_else(|| "unknown (work ahead without history)".into()),
     )
 }
 
@@ -244,7 +275,14 @@ struct Calm {
 /// in a row: at most 60 s, or 10 min when it needs the screen (a UI test
 /// can't run on a locked or busy screen anyway). Never closes anything:
 /// when it doesn't calm down it says what keeps it busy and goes on.
-fn settle(label: &str, needs: &[calm::Need], asking: bool, closed: &mut Vec<ask::App>) -> Calm {
+/// `note` gets what isn't quiet yet, each second, for `status` to show.
+fn settle(
+    label: &str,
+    needs: &[calm::Need],
+    asking: bool,
+    closed: &mut Vec<ask::App>,
+    note: &std::path::Path,
+) -> Calm {
     let quiet_needed: u32 = std::env::var("MACHINE_SLOT_SETTLE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -267,6 +305,18 @@ fn settle(label: &str, needs: &[calm::Need], asking: bool, closed: &mut Vec<ask:
         (0u32, Vec::new(), 0u64, !asking, 0u32);
     while quiet < quiet_needed && sched::now() - t0 < max && run::stop_requested().is_none() {
         last = probe.look(needs);
+        let _ = std::fs::write(
+            note,
+            format!(
+                "{}\t{}\n",
+                t0,
+                if last.is_empty() {
+                    "quiet".to_string()
+                } else {
+                    last.join(", ")
+                }
+            ),
+        );
         if last.is_empty() {
             quiet += 1;
             busy_for = 0;
@@ -431,8 +481,96 @@ impl Drop for Reopen {
     }
 }
 
-fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &[String]) -> i32 {
+/// How a turn is asked for, past its kind and label.
+pub struct Opts {
+    pub needs: Vec<calm::Need>,
+    pub asking: bool,
+    /// None: the default (a solo stops at 3 × its usual time, 10 min at
+    /// least); Some(0): no limit.
+    pub timeout: Option<u64>,
+    /// Join the queue only at this time (Unix seconds), holding nothing
+    /// until then.
+    pub at: Option<u64>,
+}
+
+/// The next time the clock shows «HH:MM», today or tomorrow, as Unix seconds.
+pub fn next_clock_time(hhmm: &str, now: u64) -> Option<u64> {
+    let (h, m) = hhmm.split_once(':')?;
+    let (h, m): (u64, u64) = (h.parse().ok()?, m.parse().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    // Local midnight from date(1), to keep time zone rules out of here.
+    let out = std::process::Command::new("date")
+        .args(["+%H %M %S"])
+        .output()
+        .ok()?;
+    let t = String::from_utf8_lossy(&out.stdout);
+    let f: Vec<u64> = t
+        .split_whitespace()
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    let since_midnight = f.first()? * 3600 + f.get(1)? * 60 + f.get(2)?;
+    let mut at = now - since_midnight + h * 3600 + m * 60;
+    if at <= now {
+        at += 86400;
+    }
+    Some(at)
+}
+
+/// A solo that hangs holds the whole machine: without a limit of its own
+/// it's stopped at 3 × its usual time, never under 10 minutes.
+pub fn time_limit(solo: bool, asked: Option<u64>, usual: Option<u64>) -> Option<u64> {
+    match asked {
+        Some(0) => None,
+        Some(s) => Some(s),
+        None if solo => usual.map(|u| (u * 3).max(600)),
+        None => None,
+    }
+}
+
+/// «90», «90s», «20m», «2h», «1h30m» → seconds.
+pub fn parse_duration(s: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut num = String::new();
+    for c in s.trim().chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        let n: u64 = num.parse().ok()?;
+        num.clear();
+        total += n * match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            _ => return None,
+        };
+    }
+    if !num.is_empty() {
+        total += num.parse::<u64>().ok()?;
+    }
+    Some(total)
+}
+
+fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
+    let (needs, asking) = (&opts.needs[..], opts.asking);
     let mode = if solo { "solo" } else { "shared" };
+    if let Some(at) = opts.at {
+        run::catch_stops();
+        eprintln!(
+            "machine-slot: {mode} «{label}» joins the queue at {} ({} from now)",
+            stamp(at),
+            clock(at.saturating_sub(sched::now()))
+        );
+        while sched::now() < at {
+            if let Some(sig) = run::stop_requested() {
+                eprintln!("machine-slot: {mode} «{label}» stopped before its time");
+                return 128 + sig;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     // Already inside a turn: a solo has the machine; a shared inside a
     // shared is still shared; a solo inside a shared would wait on itself.
     match std::env::var("MACHINE_SLOT").as_deref() {
@@ -452,11 +590,19 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
     let id = identity(cmd);
     let runs = record::read(&record_path());
     let usual = record::usual_for(&runs, mode, &id.cmd_id, &key);
+    // A solo runs on a quiet machine; a shared one at today's load.
+    let usual_now = usual.map(|u| {
+        if solo {
+            u.secs
+        } else {
+            u.now(sys::load1(), sys::cpus() as f64)
+        }
+    });
     let mut slot = match Slot::enter(
         &state_dir(),
         solo,
         &label,
-        usual.map(|u| (u.secs, u.loaded)),
+        usual.zip(usual_now).map(|(u, now)| (now, u.loaded)),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -481,7 +627,17 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
         }
         let waited = sched::now() - queued_at;
         if waited >= said {
-            eprintln!("machine-slot: {mode} «{label}» waits ({}):", clock(waited));
+            let jobs = sched::peek(&state_dir());
+            let eta = jobs
+                .iter()
+                .find(|j| j.pid == sys::me())
+                .and_then(|me| starts_in(&jobs, me, sched::now()))
+                .map(|s| format!(", should start in ~{}", clock(s)))
+                .unwrap_or_default();
+            eprintln!(
+                "machine-slot: {mode} «{label}» waits ({}{eta}):",
+                clock(waited)
+            );
             for l in status_text(&sched::peek(&state_dir())).lines() {
                 eprintln!("  {l}");
             }
@@ -494,8 +650,8 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
         eprintln!(
             "machine-slot: {mode} «{label}» starts after {}{}",
             clock(wait_s),
-            usual
-                .map(|u| format!(" (usually ~{})", clock(u.secs)))
+            usual_now
+                .map(|u| format!(" (usually ~{})", clock(u)))
                 .unwrap_or_default()
         );
     }
@@ -512,7 +668,10 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
     }
     let mut closed = Vec::new();
     let calm = if solo {
-        Some(settle(&label, needs, asking, &mut closed))
+        let note = slot.calm_path();
+        let c = settle(&label, needs, asking, &mut closed, &note);
+        let _ = std::fs::remove_file(&note);
+        Some(c)
     } else {
         None
     };
@@ -525,7 +684,15 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
     let start = sched::now();
     let progress = slot.progress_path();
     let live = slot.live_path();
-    let out = run::run(cmd, mode, &progress, &live, || slot.others_running());
+    let limit = time_limit(solo, opts.timeout, usual.map(|u| u.secs));
+    let out = run::run(
+        cmd,
+        mode,
+        &progress,
+        &live,
+        limit.map(Duration::from_secs),
+        || slot.others_running(),
+    );
     drop(slot);
     let quiet = match &calm {
         Some(c) => c.settled,
@@ -563,6 +730,7 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
         power: calm::power_note(),
         disk_mb: Some(out.disk_mb),
         peak_cpu_pct: Some(out.peak_cpu_pct),
+        timed_out: out.timed_out,
         closed_apps: closed
             .iter()
             .map(|a| a.name.clone())
@@ -583,7 +751,11 @@ fn take_turn(solo: bool, needs: &[calm::Need], asking: bool, label: &str, cmd: &
         clock((out.cpu_user_s + out.cpu_sys_s).round() as u64),
         out.peak_tree_mb,
         label,
-        if r.clean { "" } else { "  [loaded]" }
+        match (r.clean, out.timed_out) {
+            (_, true) => "  [timeout]",
+            (false, _) => "  [loaded]",
+            _ => "",
+        }
     );
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -654,6 +826,7 @@ fn state(json: bool) {
                                     ("cpu_pct", json::Json::Num(c)),
                                     ("memory_mb", json::Json::Num(m as f64)),
                                     ("disk_mbs", json::Json::Num(d)),
+                                    ("quiet_s", json::Json::Num(j.quiet_s.unwrap_or(0) as f64)),
                                 ])
                             })
                             .unwrap_or(json::Json::Null),
@@ -666,7 +839,7 @@ fn state(json: bool) {
         for j in &jobs {
             let f = fraction(j, sched::now());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 j.kind.name(),
                 j.label,
                 j.start,
@@ -680,7 +853,8 @@ fn state(json: bool) {
                     .unwrap_or_else(|| "\t\t".into()),
                 starts_in(&jobs, j, sched::now())
                     .map(|s| s.to_string())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                j.quiet_s.map(|q| q.to_string()).unwrap_or_default()
             );
         }
     }
@@ -762,8 +936,34 @@ fn main() {
             let mut i = 1;
             let mut needs = calm::DEFAULT.to_vec();
             let mut asking = false;
+            let mut timeout = None;
+            let mut at = None;
+            // Options may come before or after the label, up to `--`.
+            let mut label: Option<&str> = None;
             loop {
                 match a(i) {
+                    Some("--at") => {
+                        match a(i + 1).and_then(|t| next_clock_time(t, sched::now())) {
+                            Some(t) => at = Some(t),
+                            None => {
+                                eprintln!("machine-slot: --at takes a clock time, e.g. 23:30");
+                                std::process::exit(2);
+                            }
+                        }
+                        i += 2;
+                    }
+                    Some("--timeout") => {
+                        match a(i + 1).and_then(parse_duration) {
+                            Some(t) => timeout = Some(t),
+                            None => {
+                                eprintln!(
+                                    "machine-slot: --timeout takes a time, e.g. 90s, 20m, 1h30m (0: none)"
+                                );
+                                std::process::exit(2);
+                            }
+                        }
+                        i += 2;
+                    }
                     Some("--needs") => {
                         match a(i + 1).map(calm::Need::parse_list) {
                             Some(Ok(n)) => needs = n,
@@ -784,20 +984,34 @@ fn main() {
                         asking = true;
                         i += 1;
                     }
-                    _ => break,
+                    Some("--") | None => break,
+                    Some(l) if label.is_none() && !l.starts_with("--") => {
+                        label = Some(l);
+                        i += 1;
+                    }
+                    Some(other) => {
+                        eprintln!("machine-slot: unexpected «{other}» before --");
+                        std::process::exit(2);
+                    }
                 }
             }
-            let (Some(label), Some("--")) = (a(i), a(i + 1)) else {
+            let (Some(label), Some("--")) = (label, a(i)) else {
                 eprintln!(
-                    "usage: machine-slot {m} [--needs cpu,disk,ram,gpu,screen] [--ask] LABEL -- CMD…"
+                    "usage: machine-slot {m} [--needs cpu,disk,ram,gpu,screen] [--ask] [--timeout T] [--at HH:MM] LABEL -- CMD…"
                 );
                 std::process::exit(2);
             };
-            if args.len() < i + 3 {
+            if args.len() < i + 2 {
                 eprintln!("machine-slot: no command");
                 std::process::exit(2);
             }
-            take_turn(m == "solo", &needs, asking, label, &args[i + 2..])
+            let opts = Opts {
+                needs,
+                asking,
+                timeout,
+                at,
+            };
+            take_turn(m == "solo", &opts, label, &args[i + 1..])
         }
         Some("status") => {
             print!("{}", status_text(&sched::peek(&state_dir())));
@@ -884,4 +1098,32 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_and_limits() {
+        assert_eq!(parse_duration("90"), Some(90));
+        assert_eq!(parse_duration("20m"), Some(1200));
+        assert_eq!(parse_duration("1h30m"), Some(5400));
+        assert_eq!(parse_duration("2x"), None);
+        assert_eq!(time_limit(true, None, Some(100)), Some(600));
+        assert_eq!(time_limit(true, None, Some(1000)), Some(3000));
+        assert_eq!(time_limit(true, None, None), None);
+        assert_eq!(time_limit(false, None, Some(1000)), None);
+        assert_eq!(time_limit(false, Some(60), None), Some(60));
+        assert_eq!(time_limit(true, Some(0), Some(100)), None);
+    }
+
+    #[test]
+    fn clock_times_are_today_or_tomorrow() {
+        let now = sched::now();
+        let at = next_clock_time("03:00", now).unwrap();
+        assert!(at > now && at <= now + 86400, "{at} vs {now}");
+        assert!(next_clock_time("25:00", now).is_none());
+        assert!(next_clock_time("tonight", now).is_none());
+    }
 }

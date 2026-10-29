@@ -39,18 +39,27 @@ pub struct Outcome {
     pub disk_mb: u64,
     /// The busiest second, in % of one core (400 = four cores).
     pub peak_cpu_pct: u64,
+    /// Stopped for running past its time limit.
+    pub timed_out: bool,
 }
+
+/// Below this, a second of the tree counts as doing nothing (% of one core).
+const QUIET_CPU_PCT: f64 = 1.0;
 
 /// `others` says how many other slot jobs run right now; asked every few
 /// seconds.
 /// `progress` is handed to the command as `MACHINE_SLOT_PROGRESS`: a file it
 /// may write «37», «37 %» or «120/300» to, for an exact progress bar.
-/// `live` gets, every second, «cpu % \t memory MB \t disk MB/s» of the tree.
+/// `live` gets, every second, «cpu % \t memory MB \t disk MB/s \t quiet s»
+/// of the tree, the last being how long it has done nothing.
+/// Past `limit` the command is stopped as Ctrl-C would, and the outcome
+/// says it timed out.
 pub fn run(
     cmd: &[String],
     mode: &str,
     progress: &std::path::Path,
     live: &std::path::Path,
+    limit: Option<Duration>,
     mut others: impl FnMut() -> u32,
 ) -> Outcome {
     catch_stops();
@@ -75,6 +84,7 @@ pub fn run(
                 concurrent_max: 0,
                 disk_mb: 0,
                 peak_cpu_pct: 0,
+                timed_out: false,
             };
         }
     };
@@ -88,6 +98,7 @@ pub fn run(
     // A process that ends moves into its parent's children time, so the sum
     // only drops when the ended one's parent is outside the tree.
     let mut last_cpu: Option<u64> = None;
+    let (mut quiet_since, mut timed_out) = (Instant::now(), false);
     let status = loop {
         if let Ok(Some(st)) = child.try_wait() {
             break st;
@@ -112,10 +123,14 @@ pub fn run(
             if let Some(dcpu) = dcpu {
                 let cpu = dcpu as f64 / 1e9 / dt * 100.0;
                 peak_cpu = peak_cpu.max(cpu);
+                if cpu >= QUIET_CPU_PCT || dio > 0 {
+                    quiet_since = Instant::now();
+                }
                 let line = format!(
-                    "{cpu:.0}\t{}\t{:.1}\n",
+                    "{cpu:.0}\t{}\t{:.1}\t{}\n",
                     mem >> 20,
-                    dio as f64 / 1048576.0 / dt
+                    dio as f64 / 1048576.0 / dt,
+                    quiet_since.elapsed().as_secs()
                 );
                 let _ = std::fs::write(live, line);
             }
@@ -123,7 +138,17 @@ pub fn run(
         if tick.is_multiple_of(15) {
             concurrent = concurrent.max(others());
         }
-        let sig = SIGNALED.load(Ordering::SeqCst);
+        if !timed_out && limit.is_some_and(|l| started.elapsed() > l) {
+            eprintln!(
+                "machine-slot: past its time limit ({}s): stopping it",
+                limit.unwrap().as_secs()
+            );
+            timed_out = true;
+        }
+        let sig = match SIGNALED.load(Ordering::SeqCst) {
+            0 if timed_out => sys::SIGTERM,
+            s => s,
+        };
         if sig != 0 {
             match stopping {
                 None => {
@@ -142,9 +167,14 @@ pub fn run(
     let (user, system, rss) = sys::children_usage();
     let mb = |b: u64| (b + (1 << 19)) >> 20;
     Outcome {
-        exit: status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        // 124, as timeout(1) says it.
+        exit: if timed_out {
+            124
+        } else {
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+        },
         run_s: started.elapsed().as_secs_f64().round() as u64,
         cpu_user_s: user,
         cpu_sys_s: system,
@@ -153,5 +183,6 @@ pub fn run(
         concurrent_max: concurrent,
         disk_mb: mb(disk),
         peak_cpu_pct: peak_cpu.round() as u64,
+        timed_out,
     }
 }

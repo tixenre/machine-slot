@@ -52,6 +52,10 @@ The default is `cpu,disk,ram`. Add `gpu` for GPU work and `screen` for UI tests,
 
 **Progress.** A command may write its progress to the file named in `MACHINE_SLOT_PROGRESS`: «37», «37 %», «0.37» or «120/300». Without that, progress is estimated from the usual time and shown with a `~`.
 
+**Time limits.** A solo that hangs would hold the whole machine, so a solo stops at 3 × its usual time (10 minutes at least) unless it says otherwise: `--timeout 20m` sets its own limit, `--timeout 0` none. Shared jobs only stop with `--timeout`. A stopped job exits 124, as timeout(1) does, and the record says it timed out. While a job runs, `status` and the menu bar also say when its process tree has used no CPU and no disk for 5 minutes (`stalled?`). It's a question, not a verdict: a UI test drives an app outside its own tree.
+
+**Later.** `--at 23:30` joins the queue only at that time, holding nothing until then: a long solo for tonight doesn't block anyone now.
+
 **Squeezing in.** While a solo waits for running shared work to drain, a new shared job may still start, but only if its usual time ends before that work should. A job with no history waits.
 
 **Nesting.** Inside a turn, `machine-slot` just runs the command: a shared inside a solo uses the solo's turn. A solo inside a shared is refused, because it would wait on itself.
@@ -64,7 +68,7 @@ Waiting can take a while. In scripts and agents, run it in the background.
 
 | command | |
 |---|---|
-| `machine-slot status` | what runs (% done, CPU / memory / disk right now), what waits and when a waiting solo should start |
+| `machine-slot status` | what runs (% done, CPU / memory / disk right now), what waits and when it should start, and what a solo waiting for quiet is waiting on |
 | `machine-slot estimate LABEL [solo\|shared]` | usual time, and how long it would wait now |
 | `machine-slot times` | per task: runs, clean runs, usual time (clean / loaded), last, max, CPU, peak memory |
 | `machine-slot repeats` | tests run more than once, with every label they ran under |
@@ -96,7 +100,7 @@ Every run is one line in `runs.tsv` in the data folder (`machine-slot paths`):
 
 `times.txt` (the `times` table, rewritten after every run) and `log.txt` sit next to it.
 
-**Clean runs.** CPU time and peak memory belong to the job and change little under load. Wall time doesn't. A solo is **clean** when the machine calmed down before it started. A shared job is clean when nothing else from the queue ran beside it and the load was low (under 0.3 × CPUs). Usual times are the median of the last 5 successful runs, using clean runs when there are any. If a task only has loaded runs, its estimate is an upper bound and says so.
+**Clean runs.** CPU time and peak memory belong to the job and change little under load. Wall time doesn't. A solo is **clean** when the machine calmed down before it started. A shared job is clean when nothing else from the queue ran beside it and the load was low (under 0.3 × CPUs). Usual times are the median of the last 5 successful runs, using clean runs when there are any. Without them, loaded runs are scaled back to a free machine by the load they started at (CPU-bound work slows in proportion once the load passes the number of cores), and a shared job's estimate is scaled forward to the load right now. Only runs with no load on record make an estimate an upper bound, and it says so. Runs of a second or less did nothing and don't count.
 
 **Test identity.** `cmd_id` is a hash of the repository (its git common dir, so every worktree is the same repository), the directory inside it, and the exact command, with the checkout's path written as `<repo>` and the home folder as `~`.
 
@@ -119,7 +123,7 @@ The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override t
 `integrations/claude-code/install.sh` sets up Claude Code for the current user:
 
 - **A skill** that teaches any session to use the queue. Telling a session "use machine-slot" is enough.
-- **A PreToolUse hook** (`machine-slot hook`, a few milliseconds per command) that refuses bare builds, tests and benchmarks, with the line to use instead: cargo, `xcodebuild`, `swift build/test`, make, ninja, `cmake --build`, meson, go, zig, bazel, gradle, maven, dotnet, npm/pnpm/yarn test and build, pytest, tox, nox and `hyperfine`, plus whatever `hook_heavy` adds. Benchmarks must be `solo`. Quoted text (commit messages, echo) doesn't count.
+- **A PreToolUse hook** (`machine-slot hook`, a few milliseconds per command) that refuses bare builds, tests and benchmarks, with the line to use instead: cargo, `xcodebuild`, `swift build/test`, make, ninja, `cmake --build`, meson, go, zig, bazel, gradle, maven, dotnet, npm/pnpm/yarn test and build, pytest, tox, nox and `hyperfine`, plus whatever `hook_heavy` adds. Benchmarks must be `solo`. Quoted text (commit messages, echo) and here-document bodies don't count.
 - **The MCP server**, so a session can check the queue and estimates before it runs anything.
 
 `--uninstall` removes all three. Other agents can call the CLI or the MCP server the same way.
@@ -136,6 +140,8 @@ The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override t
 ```bash
 machine-slot solo "machine-slot: tests" -- cargo test --release   # its tests time things: run them alone
 ```
+
+On a Mac, `scripts/linux-vm-test.sh` runs clippy and the tests on Linux in a lima VM of its own.
 
 `tests/queue.rs` runs the real binary several at once in a private state; `tests/hook.rs` feeds the hook what Claude Code sends.
 

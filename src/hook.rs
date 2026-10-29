@@ -66,7 +66,44 @@ const TIMED: &[&str] = &[
 
 /// The command split into simple commands, each a list of words, with
 /// quoted text dropped and `cargo +toolchain` read as `cargo`.
+/// The command without the bodies of its here-documents: what `cat <<EOF`
+/// feeds a file is text, not commands.
+fn strip_heredocs(cmd: &str) -> String {
+    let mut out = String::new();
+    let mut pending: Vec<String> = Vec::new();
+    for line in cmd.lines() {
+        if let Some(end) = pending.first() {
+            if line.trim() == end {
+                pending.remove(0);
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        let mut rest = line;
+        while let Some(i) = rest.find("<<") {
+            let after = &rest[i + 2..];
+            if let Some(here_string) = after.strip_prefix('<') {
+                rest = here_string;
+                continue;
+            }
+            let after = after.strip_prefix('-').unwrap_or(after).trim_start();
+            let word: String = after
+                .trim_start_matches(['\'', '"', '\\'])
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !word.is_empty() {
+                pending.push(word);
+            }
+            rest = after;
+        }
+    }
+    out
+}
+
 fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
+    let cmd = &strip_heredocs(cmd);
     let mut out = vec![Vec::new()];
     let mut word = String::new();
     let mut quote: Option<char> = None;
@@ -217,6 +254,15 @@ mod tests {
                 vec!["git", "commit", "-m"],
             ]
         );
+    }
+
+    #[test]
+    fn heredoc_bodies_are_text() {
+        let cmd = "cat > notes.md <<'EOF'\nrun cargo test and make\nEOF\ncargo fmt";
+        assert_eq!(judge(cmd, &none), Verdict::Allow);
+        let cmd = "python3 - <<EOF\nmake\nEOF\ncargo build";
+        assert_eq!(judge(cmd, &none), Verdict::NeedsShared);
+        assert_eq!(judge("cat <<< 'x' && make", &none), Verdict::NeedsShared);
     }
 
     #[test]

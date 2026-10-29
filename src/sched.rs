@@ -58,6 +58,10 @@ pub struct Job {
     /// While it runs: CPU % (of one core), memory MB and disk MB/s of its
     /// whole process tree, refreshed every second.
     pub live: Option<(f64, u64, f64)>,
+    /// While it runs: seconds its tree has used no CPU and no disk.
+    pub quiet_s: Option<u64>,
+    /// A solo waiting for a quiet machine: since when, and what isn't quiet.
+    pub settling: Option<(u64, String)>,
 }
 
 impl Job {
@@ -73,6 +77,23 @@ impl Job {
             self.loaded as u8
         )
     }
+    /// A job of nobody's, for asking "what if one joined now".
+    pub fn blank() -> Job {
+        Job {
+            id: String::new(),
+            kind: Kind::Waiting,
+            label: String::new(),
+            pid: 0,
+            ticket: 0,
+            start: now(),
+            usual: None,
+            loaded: false,
+            progress: None,
+            live: None,
+            quiet_s: None,
+            settling: None,
+        }
+    }
     fn from_text(id: &str, text: &str) -> Option<Job> {
         let m: BTreeMap<&str, &str> = text.lines().filter_map(|l| l.split_once('=')).collect();
         Some(Job {
@@ -86,6 +107,8 @@ impl Job {
             loaded: m.get("loaded") == Some(&"1"),
             progress: None,
             live: None,
+            quiet_s: None,
+            settling: None,
         })
     }
 }
@@ -208,7 +231,9 @@ pub fn live(dir: &Path) -> Vec<Job> {
         let Ok(f) = File::open(&path) else { continue };
         // Getting the lock means nobody holds it: the owner is dead.
         if f.try_lock().is_ok() {
-            let _ = fs::remove_file(&path);
+            for ext in ["job", "progress", "live", "calm"] {
+                let _ = fs::remove_file(path.with_extension(ext));
+            }
             continue;
         }
         let id = path
@@ -223,6 +248,15 @@ pub fn live(dir: &Path) -> Vec<Job> {
             j.progress = fs::read_to_string(path.with_extension("progress"))
                 .ok()
                 .and_then(|t| parse_progress(&t));
+            j.settling = fs::read_to_string(path.with_extension("calm"))
+                .ok()
+                .and_then(|t| {
+                    let (since, what) = t.trim().split_once('\t')?;
+                    Some((since.parse().ok()?, what.to_string()))
+                });
+            j.quiet_s = fs::read_to_string(path.with_extension("live"))
+                .ok()
+                .and_then(|t| t.trim().split('\t').nth(3)?.parse().ok());
             j.live = fs::read_to_string(path.with_extension("live"))
                 .ok()
                 .and_then(|t| {
@@ -285,6 +319,8 @@ impl Slot {
             loaded: usual.is_some_and(|u| u.1),
             progress: None,
             live: None,
+            quiet_s: None,
+            settling: None,
         };
         let slot = Slot {
             dir: dir.to_path_buf(),
@@ -342,6 +378,11 @@ impl Slot {
         self.path.with_extension("progress")
     }
 
+    /// Where a solo says what keeps the machine from being quiet.
+    pub fn calm_path(&self) -> PathBuf {
+        self.path.with_extension("calm")
+    }
+
     /// Where the runner writes the live CPU / memory / disk of the command.
     pub fn live_path(&self) -> PathBuf {
         self.path.with_extension("live")
@@ -360,6 +401,7 @@ impl Drop for Slot {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.progress_path());
         let _ = fs::remove_file(self.live_path());
+        let _ = fs::remove_file(self.calm_path());
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -380,6 +422,8 @@ mod tests {
             loaded: false,
             progress: None,
             live: None,
+            quiet_s: None,
+            settling: None,
         }
     }
 
@@ -471,6 +515,8 @@ mod tests {
             loaded: true,
             progress: None,
             live: None,
+            quiet_s: None,
+            settling: None,
         };
         assert_eq!(Job::from_text("9-3", &j.to_text()), Some(j));
     }

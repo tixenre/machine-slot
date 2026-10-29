@@ -141,7 +141,11 @@ mod tests {
 
     #[test]
     fn usage_counts_a_childs_cpu_and_disk() {
-        let dir = std::env::temp_dir().join(format!("machine-slot-usage-{}", std::process::id()));
+        // Not the temp folder: on many Linux systems it's in memory (tmpfs)
+        // and writing there touches no disk.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("machine-slot-usage-{}", std::process::id()));
         let file = dir.join("w.bin");
         std::fs::create_dir_all(&dir).unwrap();
         // ~0.6 s of CPU, then 20 MB written and synced, then a pause to look.

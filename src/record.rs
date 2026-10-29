@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-pub const HEADER: &str = "start\tmode\tkey\twait_s\trun_s\texit\tlabel\tcpu_user_s\tcpu_sys_s\tmax_rss_mb\tpeak_tree_mb\tload_start\tconcurrent_max\tclean\tcmd_id\trepo\thead\tcommand\tneeds\tsettle_s\tnot_quiet\tpower\tclosed_apps\tdisk_mb\tpeak_cpu_pct";
+pub const HEADER: &str = "start\tmode\tkey\twait_s\trun_s\texit\tlabel\tcpu_user_s\tcpu_sys_s\tmax_rss_mb\tpeak_tree_mb\tload_start\tconcurrent_max\tclean\tcmd_id\trepo\thead\tcommand\tneeds\tsettle_s\tnot_quiet\tpower\tclosed_apps\tdisk_mb\tpeak_cpu_pct\ttimed_out";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Run {
@@ -44,6 +44,8 @@ pub struct Run {
     pub disk_mb: Option<u64>,
     /// The busiest second, % of one core.
     pub peak_cpu_pct: Option<u64>,
+    /// Stopped for running past its time limit.
+    pub timed_out: bool,
 }
 
 impl Run {
@@ -75,6 +77,7 @@ impl Run {
             self.closed_apps.clone(),
             o(self.disk_mb.map(|v| v.to_string())),
             o(self.peak_cpu_pct.map(|v| v.to_string())),
+            if self.timed_out { "1" } else { "0" }.to_string(),
         ]
         .join("\t")
     }
@@ -112,6 +115,7 @@ impl Run {
             closed_apps: get(22).unwrap_or_default().to_string(),
             disk_mb: get(23).and_then(|s| s.parse().ok()),
             peak_cpu_pct: get(24).and_then(|s| s.parse().ok()),
+            timed_out: get(25) == Some("1"),
         })
     }
 }
@@ -188,7 +192,32 @@ pub fn usual_for(runs: &[Run], mode: &str, cmd_id: &str, key: &str) -> Option<Us
         .or_else(|| usual(runs, mode, key))
 }
 
+/// How much slower CPU-bound work runs at a 1-minute load `load` on `cpus`
+/// cores: not at all while there are free cores, in proportion past that.
+pub fn slowdown(load: f64, cpus: f64) -> f64 {
+    (load / cpus.max(1.0)).max(1.0)
+}
+
+impl Usual {
+    /// The usual time on the machine as loaded as it is now. An estimate
+    /// made from loaded runs is already an upper bound: it stays as it is.
+    pub fn now(self, load: f64, cpus: f64) -> u64 {
+        if self.loaded {
+            self.secs
+        } else {
+            (self.secs as f64 * slowdown(load, cpus)).round() as u64
+        }
+    }
+}
+
 fn usual_where(runs: &[Run], pick: impl Fn(&Run) -> bool) -> Option<Usual> {
+    usual_on(runs, pick, crate::sys::cpus() as f64)
+}
+
+/// Clean runs are the usual time. Without any, loaded runs are scaled back
+/// to a free machine by the load they started at; only runs with no load on
+/// record count as they are, and make the estimate an upper bound.
+fn usual_on(runs: &[Run], pick: impl Fn(&Run) -> bool, cpus: f64) -> Option<Usual> {
     let mut good: Vec<&Run> = runs.iter().filter(|r| pick(r) && r.exit == 0).collect();
     // A run of a second or less did no work (everything cached, no test
     // matched): it says nothing about how long the task takes, unless that's
@@ -199,6 +228,17 @@ fn usual_where(runs: &[Run], pick: impl Fn(&Run) -> bool) -> Option<Usual> {
     let last5 = |v: Vec<&Run>| median(v.iter().rev().take(5).map(|r| r.run_s).collect());
     if let Some(secs) = last5(good.iter().copied().filter(|r| r.clean).collect()) {
         return Some(Usual {
+            secs,
+            loaded: false,
+        });
+    }
+    let recent: Vec<&Run> = good.iter().rev().take(5).copied().collect();
+    if !recent.is_empty() && recent.iter().all(|r| r.load_start.is_some()) {
+        let scaled = recent
+            .iter()
+            .map(|r| (r.run_s as f64 / slowdown(r.load_start.unwrap(), cpus)).round() as u64)
+            .collect();
+        return median(scaled).map(|secs| Usual {
             secs,
             loaded: false,
         });
@@ -506,6 +546,30 @@ mod tests {
             })
         );
         assert_eq!(usual(&rs, "solo", "a"), None);
+    }
+
+    #[test]
+    fn loaded_runs_are_scaled_to_a_free_machine_and_back_to_now() {
+        // On 10 cores: at load 20 a run takes twice as long, at load 5 the
+        // same as on a free machine.
+        let at = |secs, load| Run {
+            load_start: Some(load),
+            ..run("c", secs, 0, false)
+        };
+        let rs = vec![at(200, 20.0), at(100, 5.0), at(150, 15.0)];
+        let u = usual_on(&rs, |r| r.key == "c", 10.0).unwrap();
+        assert_eq!(
+            u,
+            Usual {
+                secs: 100,
+                loaded: false
+            }
+        );
+        assert_eq!(u.now(30.0, 10.0), 300);
+        assert_eq!(u.now(2.0, 10.0), 100);
+        // A run with no load on record keeps the old upper bound.
+        let old = vec![at(200, 20.0), run("c", 90, 0, false)];
+        assert!(usual_on(&old, |r| r.key == "c", 10.0).unwrap().loaded);
     }
 
     #[test]

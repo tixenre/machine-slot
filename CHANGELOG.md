@@ -15,6 +15,9 @@ First public release.
 - Runs of a second or less (nothing to do) don't count toward a task's usual time.
 - Live resources per running job — CPU %, memory and disk MB/s of its whole tree — in `status`, `state`, the MCP and the menu bar; each run records its peak CPU and disk MB.
 - `solo --ask`: asks before quitting busy apps for a run and reopens them afterwards (`reopen` finishes the job if machine-slot was killed).
+- Time limits: `--timeout T`, and a solo stops at 3 × its usual time by default (exit 124, recorded); jobs that do nothing for 5 minutes are shown as `stalled?`.
+- `--at HH:MM` joins the queue later, holding nothing until then.
+- Loaded runs are scaled to a free machine by their load, and shared estimates to the load now; waiting shared jobs, and `estimate`, say when they should start; a solo waiting for quiet says what it waits on.
 - `cancel LABEL` and `wait LABEL`; waiting solos say when they should start.
 - The hook is `machine-slot hook` (milliseconds, no jq) and knows the common build tools; `hook_heavy` / `hook_timed` add more.
 - Linux support (`/proc`, PSI, diskstats).

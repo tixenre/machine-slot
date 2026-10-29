@@ -56,6 +56,8 @@ struct Job {
     let disk: Double?
     /// Waiting solos: seconds until its turn, from the usual times ahead.
     let startsIn: Int?
+    /// Seconds its tree has used no CPU and no disk.
+    let quiet: Int?
 
     var running: Bool { kind == "solo" || kind == "shared" }
     var elapsed: Int { start.map { max(0, Int(Date().timeIntervalSince1970) - $0) } ?? 0 }
@@ -66,7 +68,7 @@ func readState() -> [Job] {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         func at(_ i: Int) -> String { i < f.count ? f[i] : "" }
         return Job(kind: at(0), label: at(1), start: Int(at(2)), usual: Int(at(3)), progress: Double(at(5)), measured: at(6) == "measured",
-                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)))
+                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)))
     }
 }
 
@@ -122,6 +124,7 @@ final class Row: NSView {
             let mem = m >= 1024 ? String(format: "%.1f GB", Double(m) / 1024) : "\(m) MB"
             var u = "CPU \(Int(c.rounded())) % · \(mem)"
             if let d = j.disk, d >= 0.5 { u += " · disk \(Int(d.rounded())) MB/s" }
+            if let q = j.quiet, q >= 300 { u += " · nothing for \(clock(q)) (stalled?)" }
             usage.stringValue = u
             usage.isHidden = false
         } else {

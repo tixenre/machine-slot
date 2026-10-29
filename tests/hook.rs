@@ -119,3 +119,19 @@ fn the_installed_script_finds_the_binary() {
     assert!(run("cargo build").contains("\"deny\""));
     assert_eq!(run("ls"), "");
 }
+
+#[test]
+fn the_scripts_are_executable() {
+    // Claude Code runs the hook as a program: without the bit it fails
+    // silently and nothing is refused.
+    use std::os::unix::fs::PermissionsExt;
+    for f in [
+        "integrations/claude-code/hook.sh",
+        "integrations/claude-code/install.sh",
+        "macos/menubar/build.sh",
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(f);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "{f} isn't executable");
+    }
+}

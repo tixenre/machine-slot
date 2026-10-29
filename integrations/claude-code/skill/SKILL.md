@@ -14,6 +14,8 @@ This machine has one queue for the heavy work of every session. Nobody orchestra
 - **Labels:** use the same label for the same kind of task. Commit ids and numbers are ignored. The same command in the same repository is the same test whatever its label.
 - **Waiting:** a run may wait. Run it in the background and keep working.
 - **Quitting busy apps:** `solo --ask` asks the user in a dialog before quitting busy apps for the run, and reopens them afterwards. Use it only when the user wants a clean measurement and agrees to be asked; never quit apps yourself.
+- **Time limits:** a solo stops at 3 × its usual time by default; give a known-long or hang-prone run `--timeout 30m` (or `0` for none). Exit 124 means it timed out.
+- **Later:** `--at 23:30` queues a long solo for later without blocking anyone now.
 - **Progress:** a long command may write its progress to the file in `$MACHINE_SLOT_PROGRESS` («37», «0.37», «120/300») for an exact bar; otherwise it's estimated from the usual time.
 
 ## Look before you run
