@@ -1,14 +1,14 @@
-# Homebrew formula, for a tap repository (mancino-dev/homebrew-tap):
-#   brew install mancino-dev/tap/machine-slot
+# Homebrew formula, for a tap repository (tixenre/homebrew-tap):
+#   brew install tixenre/tap/machine-slot
 # On each release, set `url` to the release's source tarball and `sha256`
 # to its checksum (`shasum -a 256`).
 class MachineSlot < Formula
   desc "Machine-wide queue for heavy work: builds share, benchmarks run alone"
-  homepage "https://github.com/mancino-dev/machine-slot"
-  url "https://github.com/mancino-dev/machine-slot/archive/refs/tags/v0.2.0.tar.gz"
+  homepage "https://github.com/tixenre/machine-slot"
+  url "https://github.com/tixenre/machine-slot/archive/refs/tags/v0.2.0.tar.gz"
   sha256 "REPLACE_WITH_THE_TARBALL_SHA256"
   license any_of: ["MIT", "Apache-2.0"]
-  head "https://github.com/mancino-dev/machine-slot.git", branch: "main"
+  head "https://github.com/tixenre/machine-slot.git", branch: "main"
 
   depends_on "rust" => :build
 

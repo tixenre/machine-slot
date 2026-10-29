@@ -181,7 +181,9 @@ pub fn run(
     };
     let (extend_path, limit_path) = (job.with_extension("extend"), job.with_extension("limit"));
     let worked = |lent: Duration, since: Option<Instant>| {
-        started.elapsed().saturating_sub(lent + since.map_or(Duration::ZERO, |t| t.elapsed()))
+        started
+            .elapsed()
+            .saturating_sub(lent + since.map_or(Duration::ZERO, |t| t.elapsed()))
     };
     let status = loop {
         if let Ok(Some(st)) = child.try_wait() {
@@ -232,7 +234,10 @@ pub fn run(
                 lent_since.get_or_insert_with(Instant::now);
             }
         }
-        if let Some(d) = deadline.as_mut().filter(|_| !timed_out && tick.is_multiple_of(5)) {
+        if let Some(d) = deadline
+            .as_mut()
+            .filter(|_| !timed_out && tick.is_multiple_of(5))
+        {
             if let Some(by) = std::fs::read_to_string(&extend_path)
                 .ok()
                 .and_then(|t| t.trim().parse::<u64>().ok())
@@ -254,7 +259,11 @@ pub fn run(
                      `machine-slot extend \"{label}\"` gives it 30 min more{}",
                     clock(d.limit),
                     clock(left),
-                    if d.graces_left() > 0 { " (if it still works then, it gets extra time anyway)" } else { "" }
+                    if d.graces_left() > 0 {
+                        " (if it still works then, it gets extra time anyway)"
+                    } else {
+                        ""
+                    }
                 ),
                 Step::Grace(add) => eprintln!(
                     "machine-slot: «{label}» still works at its time limit: {} more ({} left); \

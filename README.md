@@ -18,16 +18,15 @@ macOS (Apple silicon and Intel) and Linux. No daemon, no dependencies.
 ## Install
 
 ```bash
-cargo install machine-slot                       # from crates.io
-brew install mancino-dev/tap/machine-slot        # Homebrew, with the menu bar app on macOS
+cargo install --git https://github.com/tixenre/machine-slot
 ```
 
-Or take a binary from the [releases](https://github.com/mancino-dev/machine-slot/releases).
+Not on crates.io or Homebrew yet.
 
 Optional:
 
 ```bash
-git clone https://github.com/mancino-dev/machine-slot && cd machine-slot
+git clone https://github.com/tixenre/machine-slot && cd machine-slot
 integrations/claude-code/install.sh     # Claude Code hook, skill and MCP server
 macos/menubar/build.sh --install        # the menu bar app; "Open at Login" in its menu
 ```

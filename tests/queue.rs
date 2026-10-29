@@ -638,7 +638,12 @@ fn extend_gives_a_running_job_more_time() {
         .unwrap();
     until(&w, "time limit in");
     let ok = (0..20).any(|_| {
-        let done = w.cmd().args(["extend", "slow", "--by", "10s"]).status().unwrap().success();
+        let done = w
+            .cmd()
+            .args(["extend", "slow", "--by", "10s"])
+            .status()
+            .unwrap()
+            .success();
         if !done {
             pause(50);
         }

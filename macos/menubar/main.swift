@@ -80,7 +80,11 @@ func readState() -> [Job] {
     }
 }
 
-func clock(_ s: Int) -> String { s >= 60 ? "\(s / 60):" + String(format: "%02d", s % 60) : "\(s)s" }
+/// As the CLI says it: «45s», «4:05», «1h05m».
+func clock(_ s: Int) -> String {
+    if s >= 3600 { return "\(s / 3600)h" + String(format: "%02dm", s % 3600 / 60) }
+    return s >= 60 ? "\(s / 60):" + String(format: "%02d", s % 60) : "\(s)s"
+}
 
 /// A thin rounded bar: the accent color when the command reports its own
 /// progress, gray when it's estimated from the usual time.

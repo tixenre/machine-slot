@@ -259,7 +259,9 @@ pub fn live(dir: &Path) -> Vec<Job> {
         let Ok(f) = File::open(&path) else { continue };
         // Getting the lock means nobody holds it: the owner is dead.
         if f.try_lock().is_ok() {
-            for ext in ["job", "progress", "live", "calm", "go", "yield", "limit", "extend"] {
+            for ext in [
+                "job", "progress", "live", "calm", "go", "yield", "limit", "extend",
+            ] {
                 let _ = fs::remove_file(path.with_extension(ext));
             }
             continue;

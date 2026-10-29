@@ -998,7 +998,12 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
         mode,
         &progress,
         &live,
-        limit.map(|l| (run::Deadline::new(l, opts.timeout.is_none()), label.as_str())),
+        limit.map(|l| {
+            (
+                run::Deadline::new(l, opts.timeout.is_none()),
+                label.as_str(),
+            )
+        }),
         &job_path,
         || lender.tick(&mut slot),
     );
@@ -1232,10 +1237,20 @@ fn cancel(label: &str) -> i32 {
 /// More time for a running job's limit: its runner picks it up within a
 /// second.
 fn extend(label: &str, by: u64) -> i32 {
-    let jobs: Vec<Job> = named(label).into_iter().filter(|j| j.limit_at.is_some()).collect();
+    let all = named(label);
+    let jobs: Vec<&Job> = all.iter().filter(|j| j.limit_at.is_some()).collect();
     match jobs.len() {
         0 => {
-            eprintln!("machine-slot: no running job «{label}» with a time limit");
+            match all.first() {
+                None => eprintln!("machine-slot: no job «{label}»"),
+                Some(j) if !matches!(j.kind, Kind::Solo | Kind::Shared | Kind::Yielding) => {
+                    eprintln!(
+                        "machine-slot: «{}» is still waiting; its time limit starts when it runs",
+                        j.label
+                    )
+                }
+                Some(j) => eprintln!("machine-slot: «{}» has no time limit", j.label),
+            }
             1
         }
         1 => {
