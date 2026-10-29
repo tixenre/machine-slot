@@ -60,7 +60,8 @@ pub fn run(
     progress: &std::path::Path,
     live: &std::path::Path,
     limit: Option<Duration>,
-    mut others: impl FnMut() -> u32,
+    job: &std::path::Path,
+    mut others: impl FnMut() -> Option<u32>,
 ) -> Outcome {
     catch_stops();
     let started = Instant::now();
@@ -68,6 +69,7 @@ pub fn run(
         .args(&cmd[1..])
         .env("MACHINE_SLOT", mode)
         .env("MACHINE_SLOT_PROGRESS", progress)
+        .env("MACHINE_SLOT_JOB", job)
         .process_group(0)
         .spawn()
     {
@@ -135,8 +137,10 @@ pub fn run(
                 let _ = std::fs::write(live, line);
             }
         }
-        if tick.is_multiple_of(15) {
-            concurrent = concurrent.max(others());
+        // Asked every tick: it also runs a solo's pauses. While one is on,
+        // what runs beside it isn't counted against the solo.
+        if let Some(n) = others() {
+            concurrent = concurrent.max(n);
         }
         if !timed_out && limit.is_some_and(|l| started.elapsed() > l) {
             eprintln!(

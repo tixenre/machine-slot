@@ -74,8 +74,14 @@ impl Probe {
 
     /// Takes a second: every reading is over the second since the last.
     pub fn look(&mut self, needs: &[Need]) -> Vec<String> {
-        let mut busy = Vec::new();
         std::thread::sleep(std::time::Duration::from_secs(1));
+        self.look_now(needs)
+    }
+
+    /// The same over the time since the probe was made or last looked,
+    /// without waiting (callers that already pace themselves).
+    pub fn look_now(&mut self, needs: &[Need]) -> Vec<String> {
+        let mut busy = Vec::new();
         let disk = sys::disk_bytes().map(|b| (b, std::time::Instant::now()));
         if needs.contains(&Need::Disk)
             && let (Some((b0, t0)), Some((b1, t1))) = (self.prev_disk, disk)

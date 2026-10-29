@@ -54,6 +54,14 @@ The default is `cpu,disk,ram`. Add `gpu` for GPU work and `screen` for UI tests,
 
 **Time limits.** A solo that hangs would hold the whole machine, so a solo stops at 3 × its usual time (10 minutes at least) unless it says otherwise: `--timeout 20m` sets its own limit, `--timeout 0` none. Shared jobs only stop with `--timeout`. A stopped job exits 124, as timeout(1) does, and the record says it timed out. While a job runs, `status` and the menu bar also say when its process tree has used no CPU and no disk for 5 minutes (`stalled?`). It's a question, not a verdict: a UI test drives an app outside its own tree.
 
+**First runs.** A solo with no history has no usual time to stop at, so it stops at 30 minutes unless it says otherwise. `--expect 15m` says how long it should take: that stands in for the usual time (progress, start times for the others, the time limit) until the task has runs of its own.
+
+**Lending the machine.** Everything waits while a solo runs. A long benchmark made of independent parts can call `machine-slot yield` between two of them (`--for 5m`, 3 minutes by default): waiting shared work whose usual time fits runs meanwhile, then the solo waits for it to end and for the machine to calm down, and its command goes on. The time lent isn't counted against the solo's run.
+
+**Forcing.** `machine-slot go LABEL` (or **Start Now** in the menu bar) starts a waiting job now. A shared one starts beside whatever runs, and a solo measuring then is on record as not clean; a solo waiting for quiet stops waiting and is marked loaded. A solo can't jump in while another one runs: two at once would spoil both.
+
+**Who.** `status` and the menu bar say where each job was started from, «folder · branch», or whatever `MACHINE_SLOT_OWNER` says (a session name, say).
+
 **Later.** `--at 23:30` joins the queue only at that time, holding nothing until then: a long solo for tonight doesn't block anyone now.
 
 **Squeezing in.** While a solo waits for running shared work to drain, a new shared job may still start, but only if its usual time ends before that work should. A job with no history waits.
@@ -74,6 +82,8 @@ Waiting can take a while. In scripts and agents, run it in the background.
 | `machine-slot repeats` | tests run more than once, with every label they ran under |
 | `machine-slot log [N]` | the last N runs, one line each |
 | `machine-slot state [--json]` | for scripts and the menu bar |
+| `machine-slot go LABEL` | start a waiting job now (see Forcing) |
+| `machine-slot yield [--for T]` | inside a solo: lend the machine between two parts |
 | `machine-slot cancel LABEL` | stop a job the way Ctrl-C would: its whole command, recorded, turn freed |
 | `machine-slot wait LABEL` | wait for a job to end; exits as it did |
 | `machine-slot paths` | where the queue, the record and the config live |

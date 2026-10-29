@@ -14,6 +14,9 @@ pub enum Kind {
     /// The solo whose turn it is, waiting for running shared work to end.
     Draining,
     Solo,
+    /// A solo between two parts of its work (`machine-slot yield`): shared
+    /// work that fits before `yield_until` may run meanwhile.
+    Yielding,
     Shared,
     /// A shared waiting to start (not shown as running).
     Waiting,
@@ -25,6 +28,7 @@ impl Kind {
             Kind::Queued => "queued",
             Kind::Draining => "draining",
             Kind::Solo => "solo",
+            Kind::Yielding => "yielding",
             Kind::Shared => "shared",
             Kind::Waiting => "waiting",
         }
@@ -34,6 +38,7 @@ impl Kind {
             "queued" => Kind::Queued,
             "draining" => Kind::Draining,
             "solo" => Kind::Solo,
+            "yielding" => Kind::Yielding,
             "shared" => Kind::Shared,
             "waiting" => Kind::Waiting,
             _ => return None,
@@ -62,19 +67,25 @@ pub struct Job {
     pub quiet_s: Option<u64>,
     /// A solo waiting for a quiet machine: since when, and what isn't quiet.
     pub settling: Option<(u64, String)>,
+    /// Where it was started from: «folder · branch», or MACHINE_SLOT_OWNER.
+    pub owner: String,
+    /// A yielding solo takes the machine back at this time.
+    pub yield_until: Option<u64>,
 }
 
 impl Job {
     fn to_text(&self) -> String {
         format!(
-            "kind={}\nlabel={}\npid={}\nticket={}\nstart={}\nusual={}\nloaded={}\n",
+            "kind={}\nlabel={}\npid={}\nticket={}\nstart={}\nusual={}\nloaded={}\nowner={}\nyield_until={}\n",
             self.kind.name(),
             self.label.replace('\n', " "),
             self.pid,
             self.ticket,
             self.start,
             self.usual.map(|u| u.to_string()).unwrap_or_default(),
-            self.loaded as u8
+            self.loaded as u8,
+            self.owner.replace('\n', " "),
+            self.yield_until.map(|u| u.to_string()).unwrap_or_default()
         )
     }
     /// A job of nobody's, for asking "what if one joined now".
@@ -92,6 +103,8 @@ impl Job {
             live: None,
             quiet_s: None,
             settling: None,
+            owner: String::new(),
+            yield_until: None,
         }
     }
     fn from_text(id: &str, text: &str) -> Option<Job> {
@@ -109,6 +122,8 @@ impl Job {
             live: None,
             quiet_s: None,
             settling: None,
+            owner: m.get("owner").unwrap_or(&"").to_string(),
+            yield_until: m.get("yield_until").and_then(|s| s.parse().ok()),
         })
     }
 }
@@ -147,7 +162,8 @@ pub fn decide(jobs: &[Job], me: &Job, now: u64) -> Decision {
     let others = || jobs.iter().filter(|j| j.id != me.id);
     match me.kind {
         Kind::Queued => {
-            let turn_taken = others().any(|j| matches!(j.kind, Kind::Draining | Kind::Solo));
+            let turn_taken =
+                others().any(|j| matches!(j.kind, Kind::Draining | Kind::Solo | Kind::Yielding));
             let first = others()
                 .filter(|j| j.kind == Kind::Queued)
                 .all(|j| j.ticket > me.ticket);
@@ -167,6 +183,14 @@ pub fn decide(jobs: &[Job], me: &Job, now: u64) -> Decision {
         Kind::Waiting => {
             if others().any(|j| j.kind == Kind::Solo) {
                 return Decision::Wait;
+            }
+            // A solo between two parts: only work that ends before it takes
+            // the machine back.
+            if let Some(y) = others().find(|j| j.kind == Kind::Yielding) {
+                return match (me.usual, y.yield_until) {
+                    (Some(mine), Some(until)) if now + mine <= until => Decision::Go,
+                    _ => Decision::Wait,
+                };
             }
             if !others().any(|j| matches!(j.kind, Kind::Queued | Kind::Draining)) {
                 return Decision::Go;
@@ -188,7 +212,7 @@ pub fn decide(jobs: &[Job], me: &Job, now: u64) -> Decision {
                 Decision::Wait
             }
         }
-        Kind::Solo | Kind::Shared => Decision::Go,
+        Kind::Solo | Kind::Shared | Kind::Yielding => Decision::Go,
     }
 }
 
@@ -231,7 +255,7 @@ pub fn live(dir: &Path) -> Vec<Job> {
         let Ok(f) = File::open(&path) else { continue };
         // Getting the lock means nobody holds it: the owner is dead.
         if f.try_lock().is_ok() {
-            for ext in ["job", "progress", "live", "calm"] {
+            for ext in ["job", "progress", "live", "calm", "go", "yield"] {
                 let _ = fs::remove_file(path.with_extension(ext));
             }
             continue;
@@ -289,6 +313,7 @@ impl Slot {
         solo: bool,
         label: &str,
         usual: Option<(u64, bool)>,
+        owner: &str,
     ) -> std::io::Result<Slot> {
         fs::create_dir_all(dir.join("jobs"))?;
         let _g = gate(dir)?;
@@ -321,6 +346,8 @@ impl Slot {
             live: None,
             quiet_s: None,
             settling: None,
+            owner: owner.to_string(),
+            yield_until: None,
         };
         let slot = Slot {
             dir: dir.to_path_buf(),
@@ -362,8 +389,57 @@ impl Slot {
         }
     }
 
+    /// Starts now, whatever the queue says (`machine-slot go`).
+    pub fn force_start(&mut self) -> std::io::Result<bool> {
+        let _g = gate(&self.dir)?;
+        self.run_now()
+    }
+
+    /// A running solo lends the machine until `until`, or takes it back.
+    pub fn set_yield(&mut self, until: Option<u64>) -> std::io::Result<()> {
+        let _g = gate(&self.dir)?;
+        self.job.kind = if until.is_some() {
+            Kind::Yielding
+        } else {
+            Kind::Solo
+        };
+        self.job.yield_until = until;
+        self.write()
+    }
+
+    /// Asked to start now by `machine-slot go`.
+    pub fn go_requested(&self) -> bool {
+        self.path.with_extension("go").exists()
+    }
+
+    /// Where a `machine-slot yield` inside this solo asks for a pause.
+    pub fn yield_path(&self) -> PathBuf {
+        self.path.with_extension("yield")
+    }
+
+    /// The job file, for the command (`MACHINE_SLOT_JOB`).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Running shared jobs right now, other than this one.
+    pub fn shared_running(&self) -> u32 {
+        peek(&self.dir)
+            .iter()
+            .filter(|j| j.id != self.job.id && j.kind == Kind::Shared)
+            .count() as u32
+    }
+
+    /// Waiting shared jobs right now.
+    pub fn shared_waiting(&self) -> Vec<Job> {
+        peek(&self.dir)
+            .into_iter()
+            .filter(|j| j.kind == Kind::Waiting)
+            .collect()
+    }
+
     fn run_now(&mut self) -> std::io::Result<bool> {
-        self.job.kind = if matches!(self.job.kind, Kind::Draining | Kind::Queued) {
+        self.job.kind = if matches!(self.job.kind, Kind::Draining | Kind::Queued | Kind::Solo) {
             Kind::Solo
         } else {
             Kind::Shared
@@ -392,7 +468,9 @@ impl Slot {
     pub fn others_running(&self) -> u32 {
         peek(&self.dir)
             .iter()
-            .filter(|j| j.id != self.job.id && matches!(j.kind, Kind::Solo | Kind::Shared))
+            .filter(|j| {
+                j.id != self.job.id && matches!(j.kind, Kind::Solo | Kind::Shared | Kind::Yielding)
+            })
             .count() as u32
     }
 }
@@ -402,6 +480,8 @@ impl Drop for Slot {
         let _ = fs::remove_file(self.progress_path());
         let _ = fs::remove_file(self.live_path());
         let _ = fs::remove_file(self.calm_path());
+        let _ = fs::remove_file(self.path.with_extension("go"));
+        let _ = fs::remove_file(self.yield_path());
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -424,7 +504,30 @@ mod tests {
             live: None,
             quiet_s: None,
             settling: None,
+            owner: String::new(),
+            yield_until: None,
         }
+    }
+
+    #[test]
+    fn a_yielding_solo_lets_in_only_what_fits() {
+        let mut y = job("y", Kind::Yielding, 1, 0, Some(600));
+        y.yield_until = Some(1000 + 120);
+        let fits = job("a", Kind::Waiting, 2, 1000, Some(90));
+        let long = job("b", Kind::Waiting, 3, 1000, Some(300));
+        let unknown = job("c", Kind::Waiting, 4, 1000, None);
+        let queued = job("q", Kind::Queued, 5, 1000, Some(10));
+        let all = vec![
+            y,
+            fits.clone(),
+            long.clone(),
+            unknown.clone(),
+            queued.clone(),
+        ];
+        assert_eq!(decide(&all, &fits, 1000), Decision::Go);
+        assert_eq!(decide(&all, &long, 1000), Decision::Wait);
+        assert_eq!(decide(&all, &unknown, 1000), Decision::Wait);
+        assert_eq!(decide(&all, &queued, 1000), Decision::Wait);
     }
 
     #[test]
@@ -517,6 +620,8 @@ mod tests {
             live: None,
             quiet_s: None,
             settling: None,
+            owner: String::new(),
+            yield_until: None,
         };
         assert_eq!(Job::from_text("9-3", &j.to_text()), Some(j));
     }

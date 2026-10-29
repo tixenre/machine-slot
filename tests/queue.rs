@@ -338,7 +338,7 @@ fn a_running_job_shows_what_it_uses() {
     until(&w, "cpu ");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
-    assert_eq!(f.len(), 14, "{state}");
+    assert_eq!(f.len(), 15, "{state}");
     let cpu: f64 = f[7].parse().unwrap();
     let mem: u64 = f[8].parse().unwrap();
     assert!(cpu > 20.0, "a busy loop shows as busy: {state}");
@@ -492,4 +492,128 @@ fn waiting_shared_work_says_when_it_starts() {
     for j in [&mut a, &mut b] {
         assert!(j.wait().unwrap().success());
     }
+}
+
+#[test]
+fn go_starts_a_waiting_shared_beside_a_solo_and_spoils_its_record() {
+    let w = World::new("go");
+    let mut solo = w.job("solo", "measure", 6.0);
+    until(&w, "solo: measure");
+    let mut late = w.job("shared", "late", 4.0);
+    until(&w, "waiting shared: late");
+    let out = w.cmd().args(["go", "late"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    until(&w, "shared: late (");
+    assert!(late.wait().unwrap().success());
+    assert!(solo.wait().unwrap().success());
+    let ev = w.events();
+    let pos = |e: &str| ev.iter().position(|x| x == e).unwrap();
+    assert!(
+        pos("late+") < pos("measure-"),
+        "late ran beside the solo: {ev:?}"
+    );
+    let rec = std::fs::read_to_string(w.dir.join("rec/runs.tsv")).unwrap();
+    let head: Vec<&str> = rec.lines().next().unwrap().split('\t').collect();
+    let clean = head.iter().position(|h| *h == "clean").unwrap();
+    let row = rec
+        .lines()
+        .find(|l| l.split('\t').nth(6) == Some("measure"))
+        .unwrap();
+    assert_eq!(row.split('\t').nth(clean), Some("0"), "{rec}");
+    // A solo can't jump in while another one runs.
+    let mut a = w.job("solo", "first", 3.0);
+    until(&w, "solo: first");
+    let mut b = w.job("solo", "second", 0.1);
+    until(&w, "solo: second");
+    let refused = w.cmd().args(["go", "second"]).output().unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    for j in [&mut a, &mut b] {
+        assert!(j.wait().unwrap().success());
+    }
+}
+
+#[test]
+fn a_solo_can_lend_the_machine_between_two_parts() {
+    let w = World::new("yield");
+    w.seed("shared", "quick", 1);
+    let ev = w.dir.join("events");
+    let script = format!(
+        "echo 'part1' >> '{e}'; sleep 2; '{bin}' yield --for 20s; echo 'part2' >> '{e}'",
+        e = ev.display(),
+        bin = BIN
+    );
+    let mut solo = w
+        .cmd()
+        .args(["solo", "parts", "--", "sh", "-c", &script])
+        .spawn()
+        .unwrap();
+    until(&w, "solo: parts");
+    let mut quick = w.job("shared", "quick", 0.3);
+    assert!(quick.wait().unwrap().success());
+    assert!(solo.wait().unwrap().success());
+    let ev = w.events();
+    let pos = |e: &str| ev.iter().position(|x| x == e).unwrap();
+    assert!(pos("part1") < pos("quick+"), "{ev:?}");
+    assert!(
+        pos("quick-") < pos("part2"),
+        "the solo went on after the lent work: {ev:?}"
+    );
+}
+
+#[test]
+fn status_says_where_a_job_comes_from() {
+    let w = World::new("owner");
+    let mut j = w.job("shared", "here", 2.0);
+    until(&w, "shared: here");
+    assert!(w.status().contains("  — "), "{}", w.status());
+    assert!(j.wait().unwrap().success());
+    let mut k = w
+        .cmd()
+        .args(["shared", "named", "--", "sleep", "2"])
+        .env("MACHINE_SLOT_OWNER", "photo session")
+        .spawn()
+        .unwrap();
+    until(&w, "shared: named");
+    assert!(w.status().contains("— photo session"), "{}", w.status());
+    assert!(k.wait().unwrap().success());
+}
+
+#[test]
+fn expect_stands_in_for_history() {
+    let w = World::new("expect");
+    let mut j = w
+        .cmd()
+        .args(["shared", "new thing", "--expect", "40s", "--", "sleep", "2"])
+        .spawn()
+        .unwrap();
+    until(&w, "of ~40s");
+    assert!(j.wait().unwrap().success());
+}
+
+#[test]
+fn runs_in_a_repo_record_its_commit_and_branch() {
+    // This checkout is a git repository: the record has its commit, and
+    // status its branch.
+    let in_repo = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !in_repo {
+        eprintln!("not in a git checkout: skipped");
+        return;
+    }
+    let w = World::new("git");
+    let mut j = w.job("shared", "in repo", 2.0);
+    until(&w, "shared: in repo");
+    assert!(w.status().contains(" · "), "branch shown: {}", w.status());
+    assert!(j.wait().unwrap().success());
+    let rec = std::fs::read_to_string(w.dir.join("rec/runs.tsv")).unwrap();
+    let head: Vec<&str> = rec.lines().next().unwrap().split('\t').collect();
+    let row: Vec<&str> = rec.lines().nth(1).unwrap().split('\t').collect();
+    let commit = row[head.iter().position(|h| *h == "head").unwrap()];
+    assert!(commit.len() >= 7, "commit on record: {rec}");
 }

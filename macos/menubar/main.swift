@@ -61,8 +61,10 @@ struct Job {
     /// A solo waiting for a quiet machine: since when, and what isn't quiet.
     let settlingSince: Int?
     let settlingOn: String
+    /// Where it was started from: «folder · branch».
+    let owner: String
 
-    var running: Bool { kind == "solo" || kind == "shared" }
+    var running: Bool { kind == "solo" || kind == "shared" || kind == "yielding" }
     var elapsed: Int { start.map { max(0, Int(Date().timeIntervalSince1970) - $0) } ?? 0 }
 }
 
@@ -71,7 +73,7 @@ func readState() -> [Job] {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         func at(_ i: Int) -> String { i < f.count ? f[i] : "" }
         return Job(kind: at(0), label: at(1), start: Int(at(2)), usual: Int(at(3)), progress: Double(at(5)), measured: at(6) == "measured",
-                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)), settlingSince: Int(at(12)), settlingOn: at(13))
+                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)), settlingSince: Int(at(12)), settlingOn: at(13), owner: at(14))
     }
 }
 
@@ -121,8 +123,8 @@ final class Row: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func show(_ j: Job, place: Int?) {
-        let alone = j.kind == "solo" || j.kind == "draining" || j.kind == "queued"
-        title.stringValue = (alone ? "🔒 " : "") + j.label
+        let alone = j.kind == "solo" || j.kind == "draining" || j.kind == "queued" || j.kind == "yielding"
+        title.stringValue = (alone ? "🔒 " : "") + j.label + (j.owner.isEmpty ? "" : "  — \(j.owner)")
         if let c = j.cpu, let m = j.memory {
             let mem = m >= 1024 ? String(format: "%.1f GB", Double(m) / 1024) : "\(m) MB"
             var u = "CPU \(Int(c.rounded())) % · \(mem)"
@@ -134,6 +136,15 @@ final class Row: NSView {
             usage.isHidden = true
         }
         setFrameSize(NSSize(width: frame.width, height: usage.isHidden ? 50 : 64))
+        if j.kind == "yielding" {
+            bar.isHidden = false
+            bar.isIndeterminate = true
+            bar.startAnimation(nil)
+            detail.stringValue = "Lending the machine to shared work, then goes on"
+            usage.isHidden = true
+            setFrameSize(NSSize(width: frame.width, height: 50))
+            return
+        }
         if j.running, let since = j.settlingSince {
             bar.isHidden = false
             bar.isIndeterminate = true
@@ -319,6 +330,21 @@ final class Bar: NSObject, NSMenuDelegate {
             rows.append(row)
         }
         update()
+        // Start a waiting job now: what it costs is said by `machine-slot go`.
+        let startable = all.filter { !$0.running || $0.settlingSince != nil }
+        if !startable.isEmpty {
+            menu.addItem(.separator())
+            let sub = NSMenu()
+            for j in startable {
+                let i = NSMenuItem(title: j.label, action: #selector(startNow(_:)), keyEquivalent: "")
+                i.target = self
+                i.representedObject = j.label
+                sub.addItem(i)
+            }
+            let start = NSMenuItem(title: "Start Now", action: nil, keyEquivalent: "")
+            start.submenu = sub
+            menu.addItem(start)
+        }
         menu.addItem(.separator())
         for (title, file) in [("Times per task", "times.txt"), ("Record", "runs.tsv"), ("Log", "log.txt")] {
             let i = NSMenuItem(title: title, action: #selector(open(_:)), keyEquivalent: "")
@@ -346,6 +372,36 @@ final class Bar: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+
+    /// `machine-slot go`, after saying what it costs.
+    @objc func startNow(_ sender: NSMenuItem) {
+        guard let label = sender.representedObject as? String else { return }
+        let j = jobs.first { $0.label == label }
+        let soloRuns = jobs.contains { ($0.kind == "solo" || $0.kind == "yielding") && $0.label != label }
+        let alert = NSAlert()
+        alert.messageText = "Start «\(label)» now?"
+        if j?.kind == "waiting" && soloRuns {
+            alert.informativeText = "It runs beside the solo that's measuring, so that measurement won't count as clean."
+        } else if j?.settlingSince != nil {
+            alert.informativeText = "It stops waiting for a quiet machine; its run is marked as loaded."
+        } else if soloRuns {
+            alert.informativeText = "Another solo is running; two at once would spoil both. Cancel it or wait."
+        } else {
+            alert.informativeText = "It skips its place in the queue."
+        }
+        alert.addButton(withTitle: "Start Now")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let out = run(["go", label])
+        if out.isEmpty {
+            let fail = NSAlert()
+            fail.messageText = "Couldn't start «\(label)»"
+            fail.informativeText = "See `machine-slot go \"\(label)\"` in a terminal."
+            fail.runModal()
+        }
+        refresh()
+    }
 
     @objc func toggleNotify(_ sender: NSMenuItem) {
         if notify {

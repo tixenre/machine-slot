@@ -28,6 +28,9 @@ machine-slot solo [--needs LIST] [--ask] LABEL -- CMD…
                                    --timeout T: stop it after T (90s, 20m, 1h30m); a
                                    solo without one stops at 3 × its usual time
                                    (10 min at least); 0: no limit.
+                                   --expect T: how long it should take, until it
+                                   has history (a first run without it or
+                                   --timeout stops at 30 min).
                                    --at HH:MM: join the queue only then (it holds
                                    nothing until then), e.g. a long solo for tonight.
 machine-slot shared LABEL -- CMD…  together with other shared work, never during a solo.
@@ -41,6 +44,9 @@ machine-slot estimate LABEL [solo|shared]
 machine-slot state [--json]        for the menu bar and scripts
 machine-slot mcp                   read-only MCP server on stdio
 machine-slot hook                  the Claude Code Bash check (JSON on stdin)
+machine-slot go LABEL              start a waiting job now (see the README for what it costs)
+machine-slot yield [--for T]       inside a solo, between two parts: let waiting shared
+                                   work that fits in T (3 min) run, then go on
 machine-slot cancel LABEL          stop a job (its whole command), record it, free its turn
 machine-slot wait LABEL            wait for a job to end; exits as it did
 machine-slot reopen                reopen apps a killed --ask run left closed
@@ -64,6 +70,11 @@ pub fn record_path() -> PathBuf {
 /// How far along a running job is, 0 to 1, and whether that's measured
 /// (the command reports it) or estimated (elapsed against its usual time).
 pub fn fraction(j: &Job, now: u64) -> Option<(f64, bool)> {
+    // Only running work has come any way; a waiting job's start is when it
+    // joined the queue.
+    if !matches!(j.kind, Kind::Solo | Kind::Shared | Kind::Yielding) || j.settling.is_some() {
+        return None;
+    }
     if let Some(p) = j.progress {
         return Some((p, true));
     }
@@ -150,7 +161,7 @@ pub fn starts_in(jobs: &[Job], j: &Job, now: u64) -> Option<u64> {
     };
     let mut wait = 0;
     for r in jobs.iter().filter(|r| match r.kind {
-        Kind::Solo => true,
+        Kind::Solo | Kind::Yielding => true,
         // A shared job waiting behind solos doesn't wait for running shared
         // work unless a solo has to drain it first.
         Kind::Shared => solo || jobs.iter().any(|a| a.kind == Kind::Draining),
@@ -188,6 +199,11 @@ pub fn status_text(jobs: &[Job]) -> String {
                 None => format!("solo: {} ({}{})", j.label, left(j, now), live_text(j)),
             },
             Kind::Shared => format!("shared: {} ({}{})", j.label, left(j, now), live_text(j)),
+            Kind::Yielding => format!(
+                "solo: {} (lending the machine, back in ~{})",
+                j.label,
+                clock(j.yield_until.unwrap_or(now).saturating_sub(now))
+            ),
             Kind::Draining => format!(
                 "next solo: {} (waiting for running work to end{eta})",
                 j.label
@@ -202,6 +218,9 @@ pub fn status_text(jobs: &[Job]) -> String {
             ),
         };
         out.push_str(&line);
+        if !j.owner.is_empty() {
+            out.push_str(&format!("  — {}", j.owner));
+        }
         out.push('\n');
     }
     if out.is_empty() { "free\n".into() } else { out }
@@ -216,9 +235,12 @@ pub fn estimate_text(label: &str, mode: &str) -> String {
     let (load, cpus) = (sys::load1(), sys::cpus() as f64);
     // As if it joined the queue now: a solo behind every solo, a shared job
     // after them all, or right away when no solo is around.
-    let solos = jobs
-        .iter()
-        .any(|j| matches!(j.kind, Kind::Solo | Kind::Queued | Kind::Draining));
+    let solos = jobs.iter().any(|j| {
+        matches!(
+            j.kind,
+            Kind::Solo | Kind::Yielding | Kind::Queued | Kind::Draining
+        )
+    });
     let me = Job {
         kind: if mode == "solo" {
             if solos { Kind::Queued } else { Kind::Draining }
@@ -303,7 +325,12 @@ fn settle(
     let mut probe = calm::Probe::new();
     let (mut quiet, mut last, mut said, mut asked, mut busy_for) =
         (0u32, Vec::new(), 0u64, !asking, 0u32);
-    while quiet < quiet_needed && sched::now() - t0 < max && run::stop_requested().is_none() {
+    let go = note.with_extension("go");
+    while quiet < quiet_needed
+        && sched::now() - t0 < max
+        && run::stop_requested().is_none()
+        && !go.exists()
+    {
         last = probe.look(needs);
         let _ = std::fs::write(
             note,
@@ -402,6 +429,8 @@ fn settle(
 }
 
 struct Identity {
+    /// «folder · branch» it was started from, for `status`.
+    owner: String,
     cmd_id: String,
     repo: String,
     head: String,
@@ -433,6 +462,18 @@ fn identity(cmd: &[String]) -> Identity {
         l.next().unwrap_or(""),
         l.next().unwrap_or(""),
     );
+    // Its own call: rev-parse can't mix --short and --abbrev-ref.
+    let branch = if top.is_empty() {
+        String::new()
+    } else {
+        std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&cwd)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
     let cwd_s = cwd.to_string_lossy().to_string();
     // Outside a repo, the directory itself is the place.
     let (repo, rel) = if top.is_empty() {
@@ -459,7 +500,20 @@ fn identity(cmd: &[String]) -> Identity {
     } else {
         format!("{}/{rel}", repo.replace(&home, "~"))
     };
+    let place = if top.is_empty() { cwd_s.as_str() } else { top };
+    let folder = std::path::Path::new(place)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let owner = std::env::var("MACHINE_SLOT_OWNER")
+        .ok()
+        .filter(|o| !o.trim().is_empty())
+        .unwrap_or_else(|| match branch.as_str() {
+            "" => folder.clone(),
+            b => format!("{folder} · {b}"),
+        });
     Identity {
+        owner,
         cmd_id,
         repo: shown,
         head: head.to_string(),
@@ -481,6 +535,198 @@ impl Drop for Reopen {
     }
 }
 
+/// A solo's pauses: when its command runs `machine-slot yield`, waiting
+/// shared work that fits may run, then the machine is drained and let calm
+/// down again before the command goes on. Called every 200 ms by the runner;
+/// returns how many other jobs run now, None while a pause is on (the
+/// solo's own measurement isn't running then).
+struct Lender {
+    solo: bool,
+    needs: Vec<calm::Need>,
+    ticks: u32,
+    phase: Pause,
+    /// The last answer, given again between looks.
+    last: Option<u32>,
+}
+
+enum Pause {
+    None,
+    /// Lending until this time.
+    Open(u64),
+    /// Taking it back: waiting for lent work to end, then for quiet.
+    Back(u64, u32),
+}
+
+impl Lender {
+    fn new(solo: bool, needs: &[calm::Need]) -> Lender {
+        Lender {
+            solo,
+            needs: needs.to_vec(),
+            ticks: 0,
+            phase: Pause::None,
+            last: Some(0),
+        }
+    }
+
+    fn tick(&mut self, slot: &mut Slot) -> Option<u32> {
+        self.ticks += 1;
+        if self.ticks.is_multiple_of(5) {
+            self.last = self.look(slot);
+        }
+        self.last
+    }
+
+    /// Once a second.
+    fn look(&mut self, slot: &mut Slot) -> Option<u32> {
+        let ask = slot.yield_path();
+        match self.phase {
+            Pause::None => {
+                if !self.solo || !ask.exists() {
+                    return Some(slot.others_running());
+                }
+                let secs: u64 = std::fs::read_to_string(&ask)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok())
+                    .unwrap_or(180);
+                // Nobody waiting: nothing to lend.
+                if slot.shared_waiting().is_empty() {
+                    let _ = std::fs::remove_file(&ask);
+                    return Some(slot.others_running());
+                }
+                let until = sched::now() + secs;
+                let _ = slot.set_yield(Some(until));
+                eprintln!(
+                    "machine-slot: solo «{}» lends the machine for up to {}",
+                    slot.job.label,
+                    clock(secs)
+                );
+                self.phase = Pause::Open(until);
+                None
+            }
+            Pause::Open(until) => {
+                // Over when its time is up, or when nothing waiting fits.
+                let now = sched::now();
+                let fits = slot
+                    .shared_waiting()
+                    .iter()
+                    .any(|j| j.usual.is_some_and(|u| now + u <= until));
+                if now >= until || !fits {
+                    let _ = slot.set_yield(None);
+                    self.phase = Pause::Back(now, 0);
+                }
+                None
+            }
+            Pause::Back(since, quiet) => {
+                if slot.shared_running() > 0 {
+                    self.phase = Pause::Back(since, 0);
+                    return None;
+                }
+                // A few calm looks in a row (a minute at most), as before a solo.
+                let needed: u32 = std::env::var("MACHINE_SLOT_SETTLE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                let calm = needed == 0 || calm::Probe::new().look_now(&self.needs).is_empty();
+                let quiet = if calm { quiet + 1 } else { 0 };
+                if quiet >= needed || sched::now() - since > 60 {
+                    let _ = std::fs::remove_file(&ask);
+                    eprintln!(
+                        "machine-slot: solo «{}» takes the machine back after {}",
+                        slot.job.label,
+                        clock(sched::now() - since)
+                    );
+                    self.phase = Pause::None;
+                } else {
+                    self.phase = Pause::Back(since, quiet);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Inside a solo: lend the machine to waiting shared work that fits in
+/// `secs`, and come back once it's quiet again.
+fn yield_turn(secs: u64) -> i32 {
+    let Ok(job) = std::env::var("MACHINE_SLOT_JOB") else {
+        return 0; // not inside a turn: nothing to lend
+    };
+    if std::env::var("MACHINE_SLOT").as_deref() != Ok("solo") {
+        return 0;
+    }
+    let ask = std::path::Path::new(&job).with_extension("yield");
+    if std::fs::write(&ask, secs.to_string()).is_err() {
+        return 0;
+    }
+    let t = std::time::Instant::now();
+    // The solo's runner removes it once the machine is back; it's gone too
+    // if the runner is.
+    while ask.exists() && std::path::Path::new(&job).exists() {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let lent = t.elapsed().as_secs();
+    if lent > 1 {
+        eprintln!(
+            "machine-slot: back after lending the machine for {}",
+            clock(lent)
+        );
+    }
+    0
+}
+
+/// Asks a waiting job to start now: a shared one starts beside whatever
+/// runs (a running solo's run is then on record as not clean); a solo
+/// stops waiting for quiet. A solo can't jump in while another one runs.
+fn go(label: &str) -> i32 {
+    let jobs = named(label);
+    let [j] = &jobs[..] else {
+        if jobs.is_empty() {
+            eprintln!("machine-slot: no job «{label}»");
+        } else {
+            eprintln!(
+                "machine-slot: «{label}» names {} jobs; use the exact label",
+                jobs.len()
+            );
+        }
+        return 1;
+    };
+    let all = sched::peek(&state_dir());
+    let other_solo = all
+        .iter()
+        .any(|o| o.id != j.id && matches!(o.kind, Kind::Solo | Kind::Yielding));
+    match j.kind {
+        Kind::Queued | Kind::Draining if other_solo => {
+            eprintln!(
+                "machine-slot: another solo runs; two at once would spoil both (cancel it, or wait)"
+            );
+            return 1;
+        }
+        Kind::Solo if j.settling.is_none() => {
+            println!("«{}» is already running", j.label);
+            return 0;
+        }
+        Kind::Shared | Kind::Yielding => {
+            println!("«{}» is already running", j.label);
+            return 0;
+        }
+        _ => {}
+    }
+    let path = state_dir().join("jobs").join(format!("{}.go", j.id));
+    if let Err(e) = std::fs::write(&path, "") {
+        eprintln!("machine-slot: {e}");
+        return 2;
+    }
+    let what = match j.kind {
+        Kind::Waiting if other_solo => {
+            "starts beside the running solo, whose run is then not clean"
+        }
+        Kind::Solo => "stops waiting for quiet; its run is marked loaded",
+        _ => "starts now",
+    };
+    println!("«{}» {what}", j.label);
+    0
+}
+
 /// How a turn is asked for, past its kind and label.
 pub struct Opts {
     pub needs: Vec<calm::Need>,
@@ -491,6 +737,9 @@ pub struct Opts {
     /// Join the queue only at this time (Unix seconds), holding nothing
     /// until then.
     pub at: Option<u64>,
+    /// How long it should take, said by whoever runs it: the usual time
+    /// until it has history of its own.
+    pub expect: Option<u64>,
 }
 
 /// The next time the clock shows «HH:MM», today or tomorrow, as Unix seconds.
@@ -519,12 +768,14 @@ pub fn next_clock_time(hhmm: &str, now: u64) -> Option<u64> {
 }
 
 /// A solo that hangs holds the whole machine: without a limit of its own
-/// it's stopped at 3 × its usual time, never under 10 minutes.
+/// it's stopped at 3 × its usual (or expected) time, never under 10
+/// minutes, and a first run with neither stops at 30 minutes.
 pub fn time_limit(solo: bool, asked: Option<u64>, usual: Option<u64>) -> Option<u64> {
+    const FIRST_RUN_S: u64 = 1800;
     match asked {
         Some(0) => None,
         Some(s) => Some(s),
-        None if solo => usual.map(|u| (u * 3).max(600)),
+        None if solo => Some(usual.map_or(FIRST_RUN_S, |u| (u * 3).max(600))),
         None => None,
     }
 }
@@ -602,7 +853,11 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
         &state_dir(),
         solo,
         &label,
-        usual.zip(usual_now).map(|(u, now)| (now, u.loaded)),
+        usual
+            .zip(usual_now)
+            .map(|(u, now)| (now, u.loaded))
+            .or(opts.expect.map(|e| (e, false))),
+        &id.owner,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -616,6 +871,14 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
         if let Some(sig) = run::stop_requested() {
             eprintln!("machine-slot: {mode} «{label}» stopped while waiting");
             return 128 + sig;
+        }
+        if slot.go_requested() {
+            eprintln!("machine-slot: {mode} «{label}» starts now, as asked (machine-slot go)");
+            if let Err(e) = slot.force_start() {
+                eprintln!("machine-slot: {e}");
+                return 2;
+            }
+            break;
         }
         match slot.try_start() {
             Ok(true) => break,
@@ -684,14 +947,22 @@ fn take_turn(solo: bool, opts: &Opts, label: &str, cmd: &[String]) -> i32 {
     let start = sched::now();
     let progress = slot.progress_path();
     let live = slot.live_path();
-    let limit = time_limit(solo, opts.timeout, usual.map(|u| u.secs));
+    let limit = time_limit(solo, opts.timeout, usual.map(|u| u.secs).or(opts.expect));
+    if solo && limit == Some(1800) && opts.timeout.is_none() && usual.is_none() {
+        eprintln!(
+            "machine-slot: first run of «{label}»: it stops at 30 min unless given --timeout (or --expect)"
+        );
+    }
+    let mut lender = Lender::new(solo, needs);
+    let job_path = slot.path().to_path_buf();
     let out = run::run(
         cmd,
         mode,
         &progress,
         &live,
         limit.map(Duration::from_secs),
-        || slot.others_running(),
+        &job_path,
+        || lender.tick(&mut slot),
     );
     drop(slot);
     let quiet = match &calm {
@@ -796,6 +1067,7 @@ fn state(json: bool) {
                 json::Json::obj([
                     ("kind", json::Json::str(j.kind.name())),
                     ("label", json::Json::str(j.label.clone())),
+                    ("owner", json::Json::str(j.owner.clone())),
                     ("start", json::Json::Num(j.start as f64)),
                     (
                         "usual",
@@ -846,7 +1118,7 @@ fn state(json: bool) {
         for j in &jobs {
             let f = fraction(j, sched::now());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 j.kind.name(),
                 j.label,
                 j.start,
@@ -865,7 +1137,8 @@ fn state(json: bool) {
                 j.settling
                     .as_ref()
                     .map(|(since, what)| format!("{}\t{what}", since))
-                    .unwrap_or_else(|| "\t".into())
+                    .unwrap_or_else(|| "\t".into()),
+                j.owner
             );
         }
     }
@@ -949,10 +1222,21 @@ fn main() {
             let mut asking = false;
             let mut timeout = None;
             let mut at = None;
+            let mut expect = None;
             // Options may come before or after the label, up to `--`.
             let mut label: Option<&str> = None;
             loop {
                 match a(i) {
+                    Some("--expect") => {
+                        match a(i + 1).and_then(parse_duration) {
+                            Some(t) if t > 0 => expect = Some(t),
+                            _ => {
+                                eprintln!("machine-slot: --expect takes a time, e.g. 15m");
+                                std::process::exit(2);
+                            }
+                        }
+                        i += 2;
+                    }
                     Some("--at") => {
                         match a(i + 1).and_then(|t| next_clock_time(t, sched::now())) {
                             Some(t) => at = Some(t),
@@ -1008,7 +1292,7 @@ fn main() {
             }
             let (Some(label), Some("--")) = (label, a(i)) else {
                 eprintln!(
-                    "usage: machine-slot {m} [--needs cpu,disk,ram,gpu,screen] [--ask] [--timeout T] [--at HH:MM] LABEL -- CMD…"
+                    "usage: machine-slot {m} [--needs cpu,disk,ram,gpu,screen] [--ask] [--timeout T] [--expect T] [--at HH:MM] LABEL -- CMD…"
                 );
                 std::process::exit(2);
             };
@@ -1021,6 +1305,7 @@ fn main() {
                 asking,
                 timeout,
                 at,
+                expect,
             };
             take_turn(m == "solo", &opts, label, &args[i + 1..])
         }
@@ -1066,6 +1351,27 @@ fn main() {
                 2
             }
         },
+        Some("go") => match a(1) {
+            Some(label) => go(label),
+            None => {
+                eprintln!("usage: machine-slot go LABEL");
+                2
+            }
+        },
+        Some("yield") => {
+            let secs = match a(1) {
+                Some("--for") => a(2).and_then(parse_duration),
+                None => Some(180),
+                _ => None,
+            };
+            match secs {
+                Some(s) => yield_turn(s),
+                None => {
+                    eprintln!("usage: machine-slot yield [--for T]");
+                    2
+                }
+            }
+        }
         Some("wait") => match a(1) {
             Some(label) => wait_for(label),
             None => {
@@ -1116,6 +1422,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn waiting_jobs_have_no_progress() {
+        let j = Job {
+            kind: Kind::Waiting,
+            start: 100,
+            usual: Some(50),
+            ..Job::blank()
+        };
+        assert_eq!(fraction(&j, 200), None);
+        let running = Job {
+            kind: Kind::Shared,
+            ..j
+        };
+        assert_eq!(fraction(&running, 125), Some((0.5, false)));
+    }
+
+    #[test]
     fn durations_and_limits() {
         assert_eq!(parse_duration("90"), Some(90));
         assert_eq!(parse_duration("20m"), Some(1200));
@@ -1123,7 +1445,11 @@ mod tests {
         assert_eq!(parse_duration("2x"), None);
         assert_eq!(time_limit(true, None, Some(100)), Some(600));
         assert_eq!(time_limit(true, None, Some(1000)), Some(3000));
-        assert_eq!(time_limit(true, None, None), None);
+        assert_eq!(
+            time_limit(true, None, None),
+            Some(1800),
+            "a first run stops at 30 min"
+        );
         assert_eq!(time_limit(false, None, Some(1000)), None);
         assert_eq!(time_limit(false, Some(60), None), Some(60));
         assert_eq!(time_limit(true, Some(0), Some(100)), None);
