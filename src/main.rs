@@ -133,7 +133,16 @@ pub fn live_text(j: &Job) -> String {
                 Some(q) if q >= STALLED_S => format!(" · nothing for {} (stalled?)", clock(q)),
                 _ => String::new(),
             };
-            format!(" · cpu {cpu:.0} % · {mem}{disk}{quiet}")
+            // 100 % is one core busy; a GPU or VM job uses none of its own.
+            let cores = cpu / 100.0;
+            let cores = if cpu < 1.0 {
+                String::new()
+            } else if cores < 9.95 {
+                format!(" · {cores:.1} of {} cores", sys::cpus())
+            } else {
+                format!(" · {cores:.0} of {} cores", sys::cpus())
+            };
+            format!("{cores} · {mem}{disk}{quiet}")
         }
         None => String::new(),
     }

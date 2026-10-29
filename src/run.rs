@@ -101,6 +101,13 @@ pub fn run(
     // only drops when the ended one's parent is outside the tree.
     let mut last_cpu: Option<u64> = None;
     let (mut quiet_since, mut timed_out) = (Instant::now(), false);
+    // Time a solo lent the machine (`others` says None meanwhile): the
+    // shared work done then isn't the solo's, so it's not in its run time
+    // nor against its limit.
+    let (mut lent, mut lent_since) = (Duration::ZERO, None::<Instant>);
+    let worked = |lent: Duration, since: Option<Instant>| {
+        started.elapsed().saturating_sub(lent + since.map_or(Duration::ZERO, |t| t.elapsed()))
+    };
     let status = loop {
         if let Ok(Some(st)) = child.try_wait() {
             break st;
@@ -139,10 +146,18 @@ pub fn run(
         }
         // Asked every tick: it also runs a solo's pauses. While one is on,
         // what runs beside it isn't counted against the solo.
-        if let Some(n) = others() {
-            concurrent = concurrent.max(n);
+        match others() {
+            Some(n) => {
+                concurrent = concurrent.max(n);
+                if let Some(t) = lent_since.take() {
+                    lent += t.elapsed();
+                }
+            }
+            None => {
+                lent_since.get_or_insert_with(Instant::now);
+            }
         }
-        if !timed_out && limit.is_some_and(|l| started.elapsed() > l) {
+        if !timed_out && limit.is_some_and(|l| worked(lent, lent_since) > l) {
             eprintln!(
                 "machine-slot: past its time limit ({}s): stopping it",
                 limit.unwrap().as_secs()
@@ -179,7 +194,7 @@ pub fn run(
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
         },
-        run_s: started.elapsed().as_secs_f64().round() as u64,
+        run_s: worked(lent, lent_since).as_secs_f64().round() as u64,
         cpu_user_s: user,
         cpu_sys_s: system,
         max_rss_mb: mb(rss),

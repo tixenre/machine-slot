@@ -4,6 +4,8 @@
 
 First public release.
 
+- Menu bar: SF Symbols, owner on its own line, shorter times, no empty gaps, blue bar when measured; usage in cores («3.5 of 10 cores»), in `status` too.
+- Time a solo lends with `yield` no longer counts in its run time or against its limit.
 - `solo` and `shared` turns: one FIFO queue for work that must run alone, side by side for the rest.
 - While a solo waits, shared work starts only if its usual time fits before the running work ends.
 - `--needs cpu,disk,ram,gpu,screen`: a solo waits for a quiet machine in what it needs.

@@ -335,7 +335,7 @@ fn a_running_job_shows_what_it_uses() {
         .args(["shared", "busy", "--", "python3", "-c", &script])
         .spawn()
         .unwrap();
-    until(&w, "cpu ");
+    until(&w, " cores");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
     assert_eq!(f.len(), 15, "{state}");
@@ -552,9 +552,19 @@ fn a_solo_can_lend_the_machine_between_two_parts() {
         .spawn()
         .unwrap();
     until(&w, "solo: parts");
-    let mut quick = w.job("shared", "quick", 0.3);
+    let mut quick = w.job("shared", "quick", 4.0);
     assert!(quick.wait().unwrap().success());
     assert!(solo.wait().unwrap().success());
+    // The solo's own work is ~2 s; the 4 s lent aren't its time.
+    let rec = std::fs::read_to_string(w.dir.join("rec/runs.tsv")).unwrap();
+    let run_s: u64 = rec
+        .lines()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .find(|f| f[6] == "parts")
+        .unwrap()[4]
+        .parse()
+        .unwrap();
+    assert!(run_s < 4, "lent time counted: {run_s}s\n{rec}");
     let ev = w.events();
     let pos = |e: &str| ev.iter().position(|x| x == e).unwrap();
     assert!(pos("part1") < pos("quick+"), "{ev:?}");

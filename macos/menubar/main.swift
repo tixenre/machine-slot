@@ -79,117 +79,190 @@ func readState() -> [Job] {
 
 func clock(_ s: Int) -> String { s >= 60 ? "\(s / 60):" + String(format: "%02d", s % 60) : "\(s)s" }
 
-/// One job: name, a bar against its usual time, what it's doing.
+/// A thin rounded bar: the accent color when the command reports its own
+/// progress, gray when it's estimated from the usual time.
+final class Meter: NSView {
+    var value: Double = 0 { didSet { needsDisplay = true } }
+    var measured = false { didSet { needsDisplay = true } }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 4) }
+
+    override func draw(_ dirty: NSRect) {
+        let r = bounds.height / 2
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
+        var done = bounds
+        done.size.width = max(bounds.height, bounds.width * CGFloat(min(max(value, 0), 1)))
+        (measured ? NSColor.controlAccentColor : NSColor.secondaryLabelColor).setFill()
+        NSBezierPath(roundedRect: done, xRadius: r, yRadius: r).fill()
+    }
+}
+
+/// One job: what it is, where it comes from, how far along, what it uses.
+/// Lines that have nothing to say collapse (a stack view drops hidden views).
 final class Row: NSView {
+    static let width: CGFloat = 420
+    let icon = NSImageView()
     let title = NSTextField(labelWithString: "")
+    let owner = NSTextField(labelWithString: "")
+    let meter = Meter()
+    let spinner = NSProgressIndicator()
     let detail = NSTextField(labelWithString: "")
-    let bar = NSProgressIndicator()
     let usage = NSTextField(labelWithString: "")
+    let stack = NSStackView()
 
     init() {
-        super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 50))
+        super.init(frame: NSRect(x: 0, y: 0, width: Row.width, height: 50))
         title.font = .systemFont(ofSize: 13, weight: .medium)
         title.lineBreakMode = .byTruncatingTail
+        owner.font = .systemFont(ofSize: 11)
+        owner.textColor = .tertiaryLabelColor
+        owner.lineBreakMode = .byTruncatingMiddle
         detail.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         detail.textColor = .secondaryLabelColor
         detail.lineBreakMode = .byTruncatingTail
         usage.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         usage.textColor = .tertiaryLabelColor
         usage.lineBreakMode = .byTruncatingTail
-        bar.style = .bar
-        bar.controlSize = .small
-        bar.minValue = 0
-        bar.maxValue = 1
-        for v in [title, detail, bar, usage] as [NSView] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(v)
+        icon.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
+        icon.contentTintColor = .secondaryLabelColor
+        spinner.style = .bar
+        spinner.controlSize = .small
+        spinner.isIndeterminate = true
+        for f in [title, owner, detail, usage] {
+            f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
+
+        let head = NSStackView(views: [icon, title])
+        head.orientation = .horizontal
+        head.spacing = 5
+        head.alignment = .centerY
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        for v in [head, owner, meter, spinner, detail, usage] as [NSView] {
+            stack.addArrangedSubview(v)
+        }
+        stack.setCustomSpacing(4, after: owner)
+        stack.setCustomSpacing(4, after: head)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
         NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            bar.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            bar.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            bar.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 3),
-            detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            detail.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            detail.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 2),
-            usage.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            usage.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            usage.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 1),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 5),
+            meter.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            spinner.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            head.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            owner.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            detail.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            usage.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(_ j: Job, place: Int?) {
-        let alone = j.kind == "solo" || j.kind == "draining" || j.kind == "queued" || j.kind == "yielding"
-        title.stringValue = (alone ? "🔒 " : "") + j.label + (j.owner.isEmpty ? "" : "  — \(j.owner)")
-        if let c = j.cpu, let m = j.memory {
-            let mem = m >= 1024 ? String(format: "%.1f GB", Double(m) / 1024) : "\(m) MB"
-            var u = "CPU \(Int(c.rounded())) % · \(mem)"
-            if let d = j.disk, d >= 0.5 { u += " · disk \(Int(d.rounded())) MB/s" }
-            if let q = j.quiet, q >= 300 { u += " · nothing for \(clock(q)) (stalled?)" }
-            usage.stringValue = u
-            usage.isHidden = false
-        } else {
-            usage.isHidden = true
+    /// SF Symbol per kind: alone (locked), lending, side by side, waiting.
+    static func symbol(_ kind: String) -> String {
+        switch kind {
+        case "solo": return "lock.fill"
+        case "yielding": return "lock.open.fill"
+        case "draining", "queued": return "lock"
+        case "shared": return "square.stack.3d.up.fill"
+        default: return "hourglass"
         }
-        setFrameSize(NSSize(width: frame.width, height: usage.isHidden ? 50 : 64))
+    }
+
+    func show(_ j: Job, place: Int?) {
+        icon.image = NSImage(systemSymbolName: Row.symbol(j.kind), accessibilityDescription: j.kind)
+        title.stringValue = j.label
+        owner.stringValue = j.owner
+        owner.isHidden = j.owner.isEmpty
+        meter.isHidden = true
+        spinner.isHidden = true
+        usage.isHidden = true
+        defer { fit() }
+
         if j.kind == "yielding" {
-            bar.isHidden = false
-            bar.isIndeterminate = true
-            bar.startAnimation(nil)
+            spin(true)
             detail.stringValue = "Lending the machine to shared work, then goes on"
-            usage.isHidden = true
-            setFrameSize(NSSize(width: frame.width, height: 50))
             return
         }
         if j.running, let since = j.settlingSince {
-            bar.isHidden = false
-            bar.isIndeterminate = true
-            bar.startAnimation(nil)
+            spin(true)
             let waited = max(0, Int(Date().timeIntervalSince1970) - since)
             detail.stringValue = "Waiting \(clock(waited)) for a quiet machine"
             usage.stringValue = j.settlingOn
             usage.isHidden = j.settlingOn.isEmpty
-            setFrameSize(NSSize(width: frame.width, height: usage.isHidden ? 50 : 64))
             return
         }
         if j.running {
-            bar.isHidden = false
+            let el = j.elapsed
             if let p = j.progress {
-                bar.stopAnimation(nil)
-                bar.isIndeterminate = false
-                bar.doubleValue = p
-                let pct = "\(j.measured ? "" : "~")\(Int((p * 100).rounded())) %"
-                if j.measured, p > 0.02, j.elapsed > 2 {
-                    let rest = Int((Double(j.elapsed) / p - Double(j.elapsed)).rounded())
-                    detail.stringValue = "\(pct) — \(clock(j.elapsed)) so far, ~\(clock(max(0, rest))) left"
+                spin(false)
+                meter.isHidden = false
+                meter.value = p
+                meter.measured = j.measured
+                if j.measured, p > 0.02, el > 2 {
+                    let rest = Int((Double(el) / p - Double(el)).rounded())
+                    detail.stringValue = "~\(clock(max(0, rest))) left · \(clock(el)) so far"
                 } else if let u = j.usual {
-                    detail.stringValue = j.elapsed <= u
-                        ? "\(pct) — \(clock(j.elapsed)) of ~\(clock(u)), \(clock(u - j.elapsed)) left"
-                        : "\(pct) — \(clock(j.elapsed)), longer than usual (~\(clock(u)))"
+                    detail.stringValue = el <= u
+                        ? "\(clock(u - el)) left · \(clock(el)) of ~\(clock(u))"
+                        : "\(clock(el)) · longer than usual (~\(clock(u)))"
                 } else {
-                    detail.stringValue = "\(pct) — \(clock(j.elapsed))"
+                    detail.stringValue = clock(el)
                 }
             } else {
-                bar.isIndeterminate = true
-                bar.startAnimation(nil)
-                detail.stringValue = "\(clock(j.elapsed)) — no history yet"
+                spin(true)
+                detail.stringValue = "\(clock(el)) · no history yet"
             }
-        } else {
-            bar.isHidden = true
-            var why: String
-            switch j.kind {
-            case "draining": why = "Next: runs alone once the running work ends"
-            case "queued": why = "Queued to run alone" + (place.map { " (#\($0))" } ?? "")
-            default: why = "Waits for the job running alone"
-            }
-            if let s = j.startsIn { why += " · starts in ~\(clock(s))" }
-            if let u = j.usual { why += " · usually ~\(clock(u))" }
-            detail.stringValue = why
+            usage.stringValue = usageText(j)
+            usage.isHidden = usage.stringValue.isEmpty
+            return
         }
+        // Waiting: when it should start and how long it takes; why it waits
+        // only when that isn't just "behind the solo".
+        var parts: [String] = []
+        switch j.kind {
+        case "draining": parts.append("Next · waits for running work to end")
+        case "queued": parts.append(place.map { "#\($0) in line to run alone" } ?? "In line to run alone")
+        default: break
+        }
+        if let s = j.startsIn { parts.append(parts.isEmpty ? "Starts in ~\(clock(s))" : "starts in ~\(clock(s))") }
+        if let u = j.usual { parts.append("takes ~\(clock(u))") }
+        if parts.isEmpty { parts.append("Waits for the solo to end") }
+        var text = parts.joined(separator: " · ")
+        text = text.prefix(1).uppercased() + text.dropFirst()
+        detail.stringValue = text
+    }
+
+    /// Cores only when the tree uses some: a GPU baseline or a VM works
+    /// outside it, and «0 cores» would mislead.
+    func usageText(_ j: Job) -> String {
+        guard let m = j.memory else { return "" }
+        var parts: [String] = []
+        // 100 % is one core busy; say it in cores, out of the machine's.
+        if let c = j.cpu, c >= 1 {
+            let cores = c / 100
+            let n = ProcessInfo.processInfo.activeProcessorCount
+            parts.append(cores < 9.95 ? String(format: "%.1f of %d cores", cores, n) : "\(Int(cores.rounded())) of \(n) cores")
+        }
+        parts.append(m >= 1024 ? String(format: "%.1f GB", Double(m) / 1024) : "\(m) MB")
+        if let d = j.disk, d >= 0.5 { parts.append("disk \(Int(d.rounded())) MB/s") }
+        if let q = j.quiet, q >= 300 { parts.append("nothing for \(clock(q)) (stalled?)") }
+        return parts.joined(separator: " · ")
+    }
+
+    func spin(_ on: Bool) {
+        spinner.isHidden = !on
+        if on { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+    }
+
+    /// The height its visible lines need.
+    func fit() {
+        stack.layoutSubtreeIfNeeded()
+        setFrameSize(NSSize(width: Row.width, height: stack.fittingSize.height + 10))
     }
 }
 
