@@ -4,6 +4,7 @@
 
 First public release.
 
+- Menu bar: each job has its own «…» menu: Start Now or Remove from Queue while it waits, Stop while it runs (each asks first).
 - Menu bar: SF Symbols, owner on its own line, shorter times, no empty gaps, blue bar when measured; usage in cores («3.5 of 10 cores»), in `status` too.
 - Time a solo lends with `yield` no longer counts in its run time or against its limit.
 - `solo` and `shared` turns: one FIFO queue for work that must run alone, side by side for the rest.

@@ -58,7 +58,7 @@ The default is `cpu,disk,ram`. Add `gpu` for GPU work and `screen` for UI tests,
 
 **Lending the machine.** Everything waits while a solo runs. A long benchmark made of independent parts can call `machine-slot yield` between two of them (`--for 5m`, 3 minutes by default): waiting shared work whose usual time fits runs meanwhile, then the solo waits for it to end and for the machine to calm down, and its command goes on. The time lent isn't counted against the solo's run.
 
-**Forcing.** `machine-slot go LABEL` (or **Start Now** in the menu bar) starts a waiting job now. A shared one starts beside whatever runs, and a solo measuring then is on record as not clean; a solo waiting for quiet stops waiting and is marked loaded. A solo can't jump in while another one runs: two at once would spoil both.
+**Forcing.** `machine-slot go LABEL` (or **Start Now** in a job's «…» menu in the menu bar, which also has **Stop**) starts a waiting job now. A shared one starts beside whatever runs, and a solo measuring then is on record as not clean; a solo waiting for quiet stops waiting and is marked loaded. A solo can't jump in while another one runs: two at once would spoil both.
 
 **Who.** `status` and the menu bar say where each job was started from, «folder · branch», or whatever `MACHINE_SLOT_OWNER` says (a session name, say).
 

@@ -103,6 +103,7 @@ final class Meter: NSView {
 final class Row: NSView {
     static let width: CGFloat = 420
     let icon = NSImageView()
+    let dots = NSImageView()
     let title = NSTextField(labelWithString: "")
     let owner = NSTextField(labelWithString: "")
     let meter = Meter()
@@ -110,6 +111,8 @@ final class Row: NSView {
     let detail = NSTextField(labelWithString: "")
     let usage = NSTextField(labelWithString: "")
     let stack = NSStackView()
+    /// What its actions submenu was made for.
+    var actionsFor = ""
 
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Row.width, height: 50))
@@ -133,7 +136,13 @@ final class Row: NSView {
             f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
 
-        let head = NSStackView(views: [icon, title])
+        dots.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: "actions")
+        dots.symbolConfiguration = .init(pointSize: 13, weight: .regular)
+        dots.contentTintColor = .tertiaryLabelColor
+        dots.setContentHuggingPriority(.required, for: .horizontal)
+        let gap = NSView()
+        gap.setContentHuggingPriority(.init(1), for: .horizontal)
+        let head = NSStackView(views: [icon, title, gap, dots])
         head.orientation = .horizontal
         head.spacing = 5
         head.alignment = .centerY
@@ -153,7 +162,7 @@ final class Row: NSView {
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 5),
             meter.widthAnchor.constraint(equalTo: stack.widthAnchor),
             spinner.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            head.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            head.widthAnchor.constraint(equalTo: stack.widthAnchor),
             owner.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
             detail.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
             usage.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
@@ -161,6 +170,13 @@ final class Row: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Hovered: its actions open beside it, so it looks selected.
+    override func draw(_ dirty: NSRect) {
+        guard enclosingMenuItem?.isHighlighted == true else { return }
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 1), xRadius: 5, yRadius: 5).fill()
+    }
 
     /// SF Symbol per kind: alone (locked), lending, side by side, waiting.
     static func symbol(_ kind: String) -> String {
@@ -376,6 +392,13 @@ final class Bar: NSObject, NSMenuDelegate {
         for (row, j) in zip(rows, ordered()) {
             if j.kind == "queued" { place += 1 }
             row.show(j, place: j.kind == "queued" ? place : nil)
+            // Its actions follow it from waiting to running; left alone
+            // otherwise, so an open one doesn't close.
+            let key = "\(j.label)\t\(j.running)\t\(j.settlingSince != nil)"
+            if row.actionsFor != key {
+                row.actionsFor = key
+                row.enclosingMenuItem?.submenu = actions(j)
+            }
         }
     }
 
@@ -403,21 +426,6 @@ final class Bar: NSObject, NSMenuDelegate {
             rows.append(row)
         }
         update()
-        // Start a waiting job now: what it costs is said by `machine-slot go`.
-        let startable = all.filter { !$0.running || $0.settlingSince != nil }
-        if !startable.isEmpty {
-            menu.addItem(.separator())
-            let sub = NSMenu()
-            for j in startable {
-                let i = NSMenuItem(title: j.label, action: #selector(startNow(_:)), keyEquivalent: "")
-                i.target = self
-                i.representedObject = j.label
-                sub.addItem(i)
-            }
-            let start = NSMenuItem(title: "Start Now", action: nil, keyEquivalent: "")
-            start.submenu = sub
-            menu.addItem(start)
-        }
         menu.addItem(.separator())
         for (title, file) in [("Times per task", "times.txt"), ("Record", "runs.tsv"), ("Log", "log.txt")] {
             let i = NSMenuItem(title: title, action: #selector(open(_:)), keyEquivalent: "")
@@ -436,6 +444,48 @@ final class Bar: NSObject, NSMenuDelegate {
         note.state = notify ? .on : .off
         menu.addItem(note)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    /// What can be done to one job: start a waiting one now (what it costs
+    /// is said first), or stop it, running or waiting.
+    func actions(_ j: Job) -> NSMenu {
+        let m = NSMenu()
+        if !j.running || j.settlingSince != nil {
+            let go = NSMenuItem(title: "Start Now", action: #selector(startNow(_:)), keyEquivalent: "")
+            go.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
+            go.target = self
+            go.representedObject = j.label
+            m.addItem(go)
+        }
+        let stop = NSMenuItem(title: j.running ? "Stop" : "Remove from Queue", action: #selector(stop(_:)), keyEquivalent: "")
+        stop.image = NSImage(systemSymbolName: j.running ? "stop.fill" : "xmark", accessibilityDescription: nil)
+        stop.target = self
+        stop.representedObject = j.label
+        m.addItem(stop)
+        return m
+    }
+
+    /// `machine-slot cancel`: stopped as Ctrl-C would stop it.
+    @objc func stop(_ sender: NSMenuItem) {
+        guard let label = sender.representedObject as? String else { return }
+        let running = jobs.first { $0.label == label }?.running ?? false
+        let alert = NSAlert()
+        alert.messageText = running ? "Stop «\(label)»?" : "Remove «\(label)» from the queue?"
+        alert.informativeText = running
+            ? "It's stopped as Ctrl-C would stop it; whoever started it sees it fail."
+            : "It never runs; whoever started it sees it fail."
+        alert.addButton(withTitle: running ? "Stop" : "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].hasDestructiveAction = true
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if run(["cancel", label]).isEmpty {
+            let fail = NSAlert()
+            fail.messageText = "Couldn't stop «\(label)»"
+            fail.informativeText = "See `machine-slot cancel \"\(label)\"` in a terminal."
+            fail.runModal()
+        }
+        refresh()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
