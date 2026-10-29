@@ -58,6 +58,9 @@ struct Job {
     let startsIn: Int?
     /// Seconds its tree has used no CPU and no disk.
     let quiet: Int?
+    /// A solo waiting for a quiet machine: since when, and what isn't quiet.
+    let settlingSince: Int?
+    let settlingOn: String
 
     var running: Bool { kind == "solo" || kind == "shared" }
     var elapsed: Int { start.map { max(0, Int(Date().timeIntervalSince1970) - $0) } ?? 0 }
@@ -68,7 +71,7 @@ func readState() -> [Job] {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         func at(_ i: Int) -> String { i < f.count ? f[i] : "" }
         return Job(kind: at(0), label: at(1), start: Int(at(2)), usual: Int(at(3)), progress: Double(at(5)), measured: at(6) == "measured",
-                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)))
+                   cpu: Double(at(7)), memory: Int(at(8)), disk: Double(at(9)), startsIn: Int(at(10)), quiet: Int(at(11)), settlingSince: Int(at(12)), settlingOn: at(13))
     }
 }
 
@@ -131,6 +134,17 @@ final class Row: NSView {
             usage.isHidden = true
         }
         setFrameSize(NSSize(width: frame.width, height: usage.isHidden ? 50 : 64))
+        if j.running, let since = j.settlingSince {
+            bar.isHidden = false
+            bar.isIndeterminate = true
+            bar.startAnimation(nil)
+            let waited = max(0, Int(Date().timeIntervalSince1970) - since)
+            detail.stringValue = "Waiting \(clock(waited)) for a quiet machine"
+            usage.stringValue = j.settlingOn
+            usage.isHidden = j.settlingOn.isEmpty
+            setFrameSize(NSSize(width: frame.width, height: usage.isHidden ? 50 : 64))
+            return
+        }
         if j.running {
             bar.isHidden = false
             if let p = j.progress {

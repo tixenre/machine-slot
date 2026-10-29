@@ -338,7 +338,7 @@ fn a_running_job_shows_what_it_uses() {
     until(&w, "cpu ");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     let f: Vec<&str> = state.lines().next().unwrap().split('\t').collect();
-    assert_eq!(f.len(), 12, "{state}");
+    assert_eq!(f.len(), 14, "{state}");
     let cpu: f64 = f[7].parse().unwrap();
     let mem: u64 = f[8].parse().unwrap();
     assert!(cpu > 20.0, "a busy loop shows as busy: {state}");

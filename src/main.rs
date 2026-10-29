@@ -813,6 +813,13 @@ fn state(json: bool) {
                     ),
                     ("progress_measured", json::Json::Bool(j.progress.is_some())),
                     (
+                        "waiting_for_quiet",
+                        j.settling
+                            .as_ref()
+                            .map(|(_, what)| json::Json::str(what.clone()))
+                            .unwrap_or(json::Json::Null),
+                    ),
+                    (
                         "starts_in",
                         starts_in(&jobs, j, sched::now())
                             .map(|s| json::Json::Num(s as f64))
@@ -839,7 +846,7 @@ fn state(json: bool) {
         for j in &jobs {
             let f = fraction(j, sched::now());
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 j.kind.name(),
                 j.label,
                 j.start,
@@ -854,7 +861,11 @@ fn state(json: bool) {
                 starts_in(&jobs, j, sched::now())
                     .map(|s| s.to_string())
                     .unwrap_or_default(),
-                j.quiet_s.map(|q| q.to_string()).unwrap_or_default()
+                j.quiet_s.map(|q| q.to_string()).unwrap_or_default(),
+                j.settling
+                    .as_ref()
+                    .map(|(since, what)| format!("{}\t{what}", since))
+                    .unwrap_or_else(|| "\t".into())
             );
         }
     }
