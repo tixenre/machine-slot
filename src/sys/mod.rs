@@ -62,6 +62,14 @@ pub struct ProcUsage {
 
 /// The 1-minute load average.
 pub fn load1() -> f64 {
+    // A load to plan with instead of the machine's: tests on a busy CI
+    // runner would otherwise see their estimates scaled by it.
+    if let Some(l) = std::env::var("MACHINE_SLOT_LOAD")
+        .ok()
+        .and_then(|l| l.parse().ok())
+    {
+        return l;
+    }
     let mut l = [0f64; 3];
     // SAFETY: l holds the 3 doubles asked for.
     if unsafe { getloadavg(l.as_mut_ptr(), 3) } < 1 {

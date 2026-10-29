@@ -23,6 +23,7 @@ impl World {
         c.env("MACHINE_SLOT_STATE", self.dir.join("state"))
             .env("MACHINE_SLOT_DIR", self.dir.join("rec"))
             .env("MACHINE_SLOT_SETTLE", "0")
+            .env("MACHINE_SLOT_LOAD", "0")
             .env_remove("MACHINE_SLOT");
         c
     }
@@ -285,16 +286,23 @@ fn mcp_answers_tools() {
 #[test]
 fn a_command_can_report_its_progress() {
     let w = World::new("progress");
-    let script = "echo 30/120 > \"$MACHINE_SLOT_PROGRESS\"; sleep 3";
+    // It holds until the test has seen it: a slow machine can't end it
+    // between two looks.
+    let release = w.dir.join("release");
+    let script = format!(
+        "echo 30/120 > \"$MACHINE_SLOT_PROGRESS\"; while [ ! -e '{}' ]; do sleep 0.1; done",
+        release.display()
+    );
     let mut j = w
         .cmd()
-        .args(["shared", "reporting", "--", "sh", "-c", script])
+        .args(["shared", "reporting", "--", "sh", "-c", &script])
         .spawn()
         .unwrap();
     until(&w, "shared: reporting");
     until(&w, "25 %");
     let state = String::from_utf8(w.cmd().arg("state").output().unwrap().stdout).unwrap();
     assert!(state.contains("\t0.250\tmeasured"), "{state}");
+    std::fs::write(&release, "").unwrap();
     assert!(j.wait().unwrap().success());
     // The progress file goes with the job.
     assert!(
@@ -541,9 +549,12 @@ fn a_solo_can_lend_the_machine_between_two_parts() {
     let w = World::new("yield");
     w.seed("shared", "quick", 1);
     let ev = w.dir.join("events");
+    // It lends only once the quick job waits, whatever the machine's speed.
+    let ready = w.dir.join("ready");
     let script = format!(
-        "echo 'part1' >> '{e}'; sleep 2; '{bin}' yield --for 20s; echo 'part2' >> '{e}'",
+        "echo 'part1' >> '{e}'; while [ ! -e '{r}' ]; do sleep 0.1; done; '{bin}' yield --for 20s; echo 'part2' >> '{e}'",
         e = ev.display(),
+        r = ready.display(),
         bin = BIN
     );
     let mut solo = w
@@ -553,6 +564,8 @@ fn a_solo_can_lend_the_machine_between_two_parts() {
         .unwrap();
     until(&w, "solo: parts");
     let mut quick = w.job("shared", "quick", 4.0);
+    until(&w, "waiting shared: quick");
+    std::fs::write(&ready, "").unwrap();
     assert!(quick.wait().unwrap().success());
     assert!(solo.wait().unwrap().success());
     // The solo's own work is ~2 s; the 4 s lent aren't its time.

@@ -131,7 +131,7 @@ Every run is one line in `runs.tsv` in the data folder (`machine-slot paths`):
 | `hook_allow` | tools that take their own turns |
 | `ask_keep` | apps `--ask` never offers to quit (names or bundle ids) |
 
-The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override the state and data folders. `MACHINE_SLOT_SETTLE=0` skips the wait for quiet (for CI).
+The `MACHINE_SLOT_STATE` and `MACHINE_SLOT_DIR` environment variables override the state and data folders. `MACHINE_SLOT_SETTLE=0` skips the wait for quiet and `MACHINE_SLOT_LOAD=0` plans as if the machine were free (both for tests and CI).
 
 ## With AI coding agents
 
