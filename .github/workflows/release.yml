@@ -1,6 +1,6 @@
 name: release
 
-# Push a tag like v0.2.0: builds the binaries and the menu bar app and
+# Push a tag like v0.1.0: builds the binaries and the menu bar app and
 # attaches them to a draft GitHub release, to be checked and published by hand.
 on:
   push:

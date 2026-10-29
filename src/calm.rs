@@ -236,12 +236,20 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn probes_read_what_ioreg_shows() {
-        let gpu = sys::gpu_util().expect("IOAccelerator");
-        assert!(gpu <= 100);
-        assert!(ioreg("IOAccelerator", "Device Utilization %").is_some());
-        let idle = sys::input_idle_s().expect("HIDIdleTime");
-        let oracle = ioreg("IOHIDSystem", "HIDIdleTime").unwrap() as f64 / 1e9;
-        assert!((idle - oracle).abs() < 2.0, "{idle} vs ioreg {oracle}");
+        // What ioreg has, the probes read; what it lacks (a VM has no GPU
+        // utilization, a headless one no HID idle time), they say is unknown.
+        match ioreg("IOAccelerator", "Device Utilization %") {
+            Some(_) => assert!(sys::gpu_util().expect("IOAccelerator") <= 100),
+            None => assert_eq!(sys::gpu_util(), None),
+        }
+        match ioreg("IOHIDSystem", "HIDIdleTime") {
+            Some(ns) => {
+                let idle = sys::input_idle_s().expect("HIDIdleTime");
+                let oracle = ns as f64 / 1e9;
+                assert!((idle - oracle).abs() < 2.0, "{idle} vs ioreg {oracle}");
+            }
+            None => assert_eq!(sys::input_idle_s(), None),
+        }
         // Writing 32 MB to disk shows in the drivers' byte counts.
         let before = sys::disk_bytes().expect("IOBlockStorageDriver");
         let path = std::env::temp_dir().join(format!("machine-slot-disk-{}", std::process::id()));

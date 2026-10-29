@@ -5,7 +5,7 @@
 class MachineSlot < Formula
   desc "Machine-wide queue for heavy work: builds share, benchmarks run alone"
   homepage "https://github.com/tixenre/machine-slot"
-  url "https://github.com/tixenre/machine-slot/archive/refs/tags/v0.2.0.tar.gz"
+  url "https://github.com/tixenre/machine-slot/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "REPLACE_WITH_THE_TARBALL_SHA256"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/tixenre/machine-slot.git", branch: "main"
